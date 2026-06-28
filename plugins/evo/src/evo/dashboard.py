@@ -10,12 +10,16 @@ from typing import Any
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .core import (
+    PRUNE_KIND_EXHAUSTED,
+    PRUNE_KINDS,
     _load_meta,
     _save_meta,
     attempt_dir,
     attempt_outcome_path,
     attempt_traces_dir,
     best_committed_score,
+    best_spine_ids,
+    effective_status,
     evo_dir,
     experiments_dir_for,
     frontier_nodes,
@@ -26,6 +30,7 @@ from .core import (
     load_annotations,
     load_config,
     load_graph,
+    lineage_invalidated_by,
     repo_root,
     runtime_env_summary,
     runtime_env_values_path,
@@ -61,6 +66,7 @@ def _public_node(
     node: dict[str, Any],
     *,
     workspace_config: dict[str, Any],
+    graph: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from .backends import backend_spec_for_node, backend_state_key
 
@@ -86,6 +92,11 @@ def _public_node(
         resolved["provider"] = backend_config.get("provider")
     public["resolved_backend"] = resolved
     public["checks"] = _checks_summary(root, node.get("id", ""))
+    if graph is not None:
+        public["effective_status"] = effective_status(graph, node)
+        blocker = lineage_invalidated_by(graph, node.get("id", ""))
+        public["lineage_blocked_by"] = blocker.get("id") if blocker else None
+        public["lineage_blocked_reason"] = blocker.get("pruned_reason") if blocker else None
     return public
 
 
@@ -657,6 +668,10 @@ def create_app(root: Path | None = None) -> Flask:
         graph = load_graph(_root())
         nodes = [node for node in graph["nodes"].values() if node["id"] != "root"]
         metric = config.get("metric", "max")
+        effective_counts: dict[str, int] = {}
+        for node in nodes:
+            status = effective_status(graph, node)
+            effective_counts[status] = effective_counts.get(status, 0) + 1
         baseline = None
         for node in graph["nodes"].values():
             if node.get("parent") == "root" and node.get("score") is not None:
@@ -670,13 +685,15 @@ def create_app(root: Path | None = None) -> Flask:
                 "best_score": best_committed_score(graph, metric),
                 "baseline_score": baseline,
                 "total_experiments": len(nodes),
-                "committed": sum(1 for node in nodes if node.get("status") == "committed"),
-                "evaluated": sum(1 for node in nodes if node.get("status") == "evaluated"),
-                "discarded": sum(1 for node in nodes if node.get("status") == "discarded"),
-                "active": sum(1 for node in nodes if node.get("status") == "active"),
-                "pending": sum(1 for node in nodes if node.get("status") == "pending"),
-                "failed": sum(1 for node in nodes if node.get("status") == "failed"),
-                "pruned": sum(1 for node in nodes if node.get("status") == "pruned"),
+                "committed": effective_counts.get("committed", 0),
+                "evaluated": effective_counts.get("evaluated", 0),
+                "discarded": effective_counts.get("discarded", 0),
+                "active": effective_counts.get("active", 0),
+                "pending": effective_counts.get("pending", 0),
+                "failed": effective_counts.get("failed", 0),
+                "pruned": effective_counts.get("pruned", 0),
+                "invalidated": effective_counts.get("invalidated", 0),
+                "lineage_blocked": effective_counts.get("lineage_blocked", 0),
                 "frontier": len(frontier_nodes(graph)),
                 "eval_epoch": config.get("current_eval_epoch", 1),
             }
@@ -689,7 +706,7 @@ def create_app(root: Path | None = None) -> Flask:
         graph = load_graph(root)
         public_graph = dict(graph)
         public_graph["nodes"] = {
-            node_id: _public_node(root, node, workspace_config=config)
+            node_id: _public_node(root, node, workspace_config=config, graph=graph)
             for node_id, node in graph["nodes"].items()
         }
         return jsonify(public_graph)
@@ -720,25 +737,51 @@ def create_app(root: Path | None = None) -> Flask:
     def node(exp_id: str):
         root = _root()
         config = load_config(root)
-        return jsonify(_public_node(root, load_graph(root)["nodes"][exp_id], workspace_config=config))
+        graph = load_graph(root)
+        return jsonify(_public_node(root, graph["nodes"][exp_id], workspace_config=config, graph=graph))
 
     @app.post("/api/node/<exp_id>/prune")
     def prune_node(exp_id: str):
         """Mark a node as pruned with a reason. Mirrors `evo prune <exp_id>`.
 
-        Pruning removes a committed/evaluated leaf from the frontier without
-        deleting the commit. Active/failed/discarded/already-pruned nodes
-        cannot be pruned.
+        Exhausted pruning removes a committed/evaluated leaf from the frontier
+        without deleting the commit or disqualifying its score. Invalid pruning
+        excludes the node and descendants from best/frontier/ship selection.
         """
         body = request.get_json(silent=True) or {}
         reason = (body.get("reason") or "").strip()
         if not reason:
             return jsonify({"error": "reason is required"}), 400
+        prune_kind = (body.get("kind") or PRUNE_KIND_EXHAUSTED).strip()
+        if prune_kind not in PRUNE_KINDS:
+            return (
+                jsonify({"error": "kind must be one of: exhausted, invalid"}),
+                400,
+            )
 
         root = _root()
+        config = load_config(root)
         graph = load_graph(root)
         if exp_id not in graph["nodes"]:
             return jsonify({"error": f"unknown experiment {exp_id!r}"}), 404
+        metric = str(config.get("metric", "max"))
+        if (
+            prune_kind == PRUNE_KIND_INVALID
+            and exp_id in best_spine_ids(graph, metric)
+            and not bool(body.get("yes"))
+        ):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{exp_id} is on the current best valid spine. "
+                            f"Confirm before invalidating it."
+                        ),
+                        "requires_yes": True,
+                    }
+                ),
+                409,
+            )
         current_status = graph["nodes"][exp_id].get("status")
         if current_status not in ("committed", "evaluated"):
             return (
@@ -756,13 +799,14 @@ def create_app(root: Path | None = None) -> Flask:
         def _mark(current_node: dict, _graph: dict) -> None:
             current_node["status"] = "pruned"
             current_node["pruned_reason"] = reason
+            current_node["prune_kind"] = prune_kind
 
         try:
             updated = update_node(root, exp_id, _mark)
         except (KeyError, RuntimeError) as exc:
             return jsonify({"error": str(exc)}), 400
-        config = load_config(root)
-        return jsonify(_public_node(root, updated, workspace_config=config))
+        graph = load_graph(root)
+        return jsonify(_public_node(root, updated, workspace_config=config, graph=graph))
 
     @app.get("/api/workspace")
     def workspace():
@@ -857,7 +901,139 @@ def create_app(root: Path | None = None) -> Flask:
                 target = attempt_dir(_root(), exp_id, attempt) / filename
         if not target.exists():
             return Response("", mimetype="text/plain")
-        return Response(target.read_text(encoding="utf-8"), mimetype="text/plain")
+        # Query params for incremental tailing:
+        #   ?tail=N  -> return only the last N lines (cheap when N << file size).
+        #   ?offset=M -> return bytes from offset M onward; pair with the
+        #                "X-Log-Size" response header so the client can poll
+        #                with offset=<prev-size> for a true append-only feed.
+        try:
+            tail = int(request.args.get("tail", "0"))
+        except ValueError:
+            tail = 0
+        try:
+            offset = int(request.args.get("offset", "0"))
+        except ValueError:
+            offset = 0
+        size = target.stat().st_size
+        if offset:
+            with target.open("rb") as fh:
+                fh.seek(min(offset, size))
+                data = fh.read()
+            text = data.decode("utf-8", errors="replace")
+        elif tail > 0:
+            # Cheap last-N-lines: read a bounded tail (4 KiB per line cap)
+            # then split; avoids loading huge files for a short tail.
+            window = min(size, max(tail * 4096, 65536))
+            with target.open("rb") as fh:
+                fh.seek(max(0, size - window))
+                chunk = fh.read()
+            text = chunk.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            text = "\n".join(lines[-tail:])
+        else:
+            text = target.read_text(encoding="utf-8")
+        resp = Response(text, mimetype="text/plain")
+        resp.headers["X-Log-Size"] = str(size)
+        return resp
+
+    @app.get("/api/node/<exp_id>/logs")
+    def node_logs(exp_id: str):
+        # List candidate log files in the latest attempt dir. Returns file
+        # name + byte size so the client can pick one and poll incrementally.
+        attempt = _latest_attempt_n(_root(), exp_id)
+        if attempt is None:
+            return jsonify({"attempt": None, "files": []})
+        dirpath = attempt_dir(_root(), exp_id, attempt)
+        files: list[dict[str, Any]] = []
+        if dirpath.exists():
+            # Surface .log and .out at the attempt root and one level under
+            # logs/ (the convention training scripts typically use).
+            patterns = ["*.log", "*.out", "logs/*.log", "logs/*.out"]
+            seen: set[Path] = set()
+            for pat in patterns:
+                for p in sorted(dirpath.glob(pat)):
+                    if p in seen or not p.is_file():
+                        continue
+                    seen.add(p)
+                    files.append({
+                        "name": str(p.relative_to(dirpath)),
+                        "size": p.stat().st_size,
+                        "mtime": p.stat().st_mtime,
+                    })
+        return jsonify({"attempt": attempt, "files": files})
+
+    @app.get("/api/node/<exp_id>/trackio")
+    def node_trackio(exp_id: str):
+        # Reads .trackio_url written by the training callback (see
+        # posttrainbench-evo/scripts/trl_trackio_callback.py). File format:
+        #   url=<space url>
+        #   space_id=<owner>/<name>
+        #   project=<project>
+        #   run_name=<run>
+        # If huggingface_hub + pandas + pyarrow are importable AND the
+        # corresponding HF Dataset exists, also return the last ~60 rows
+        # of the run's metrics for a sparkline. All optional -- if any
+        # piece is missing, return what we have and let the client render
+        # just the link.
+        attempt = _latest_attempt_n(_root(), exp_id)
+        if attempt is None:
+            return jsonify({"url": None})
+        marker = attempt_traces_dir(_root(), exp_id, attempt) / ".trackio_url"
+        if not marker.exists():
+            return jsonify({"url": None})
+        meta: dict[str, str] = {}
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                meta[k.strip()] = v.strip()
+        url = meta.get("url")
+        if not url:
+            return jsonify({"url": None})
+        result: dict[str, Any] = {
+            "url": url,
+            "space_id": meta.get("space_id"),
+            "project": meta.get("project"),
+            "run_name": meta.get("run_name"),
+            "scalars": None,
+        }
+        space_id = meta.get("space_id")
+        project = meta.get("project")
+        run_name = meta.get("run_name")
+        if space_id and project:
+            try:
+                from huggingface_hub import hf_hub_download
+                import pandas as pd  # type: ignore
+                dataset_id = f"{space_id}-dataset"
+                pq_path = hf_hub_download(
+                    repo_id=dataset_id,
+                    repo_type="dataset",
+                    filename=f"{project}.parquet",
+                )
+                df = pd.read_parquet(pq_path)
+                if run_name:
+                    df = df[df["run_name"] == run_name]
+                # Take last 60 rows for the sparkline; collect numeric cols.
+                df = df.sort_values("step").tail(60)
+                scalars: dict[str, list[dict[str, float]]] = {}
+                for col in df.columns:
+                    if col in ("id", "timestamp", "run_name", "step"):
+                        continue
+                    series = df[col].dropna()
+                    if series.empty:
+                        continue
+                    # Only keep numeric (loss/lr/grad_norm style) cols.
+                    try:
+                        vals = [float(x) for x in series.tolist()]
+                    except (TypeError, ValueError):
+                        continue
+                    steps = df.loc[series.index, "step"].astype(int).tolist()
+                    scalars[col] = [{"step": s, "value": v} for s, v in zip(steps, vals)]
+                result["scalars"] = scalars
+            except Exception:
+                # Any failure (no deps, dataset missing, parquet schema
+                # mismatch) -- just return the link, no sparkline.
+                pass
+        return jsonify(result)
 
     @app.get("/api/active")
     def active():
@@ -1059,8 +1235,9 @@ def create_app(root: Path | None = None) -> Flask:
 def main() -> None:
     import os
     port = int(os.environ.get("EVO_DASHBOARD_PORT", "8080"))
+    host = os.environ.get("EVO_DASHBOARD_HOST", "127.0.0.1")
     app = create_app()
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)
 
 
 if __name__ == "__main__":

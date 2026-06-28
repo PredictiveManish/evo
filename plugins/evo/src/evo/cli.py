@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -13,6 +14,8 @@ from typing import Any
 
 from . import DISTRIBUTION_NAME, __version__
 from .core import (
+    PRUNE_KIND_EXHAUSTED,
+    PRUNE_KIND_INVALID,
     SUPPORTED_HOSTS,
     _load_meta,
     add_gate,
@@ -25,12 +28,16 @@ from .core import (
     attempt_log_path,
     attempt_outcome_path,
     attempt_traces_dir,
+    best_committed_node,
+    best_committed_score,
+    best_spine_ids,
     collect_gates_from_path,
     compare_scores,
     config_path,
     current_branch,
     delete_discarded_experiment,
     evo_dir,
+    effective_status,
     experiment_log_path,
     experiment_result_path,
     experiments_dir_for,
@@ -40,6 +47,7 @@ from .core import (
     graph_path,
     init_workspace,
     list_all_notes,
+    lineage_invalidated_by,
     load_annotations,
     load_config,
     load_graph,
@@ -65,6 +73,7 @@ from .core import (
     worktrees_path,
     workspace_path,
     allocate_experiment,
+    capture_experiment_diff,
     remove_worktree_only,
     render_git_diff,
 )
@@ -370,6 +379,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         host=args.host,
         commit_strategy=commit_strategy,
         project_name=args.name,
+        per_exp_timeout=args.per_exp_timeout,
     )
     if args.instrumentation_mode:
         meta_file = evo_dir(root) / "meta.json"
@@ -548,6 +558,93 @@ def cmd_defaults_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _current_telemetry_workspace_props(exp_id: str | None = None) -> dict[str, Any]:
+    try:
+        return _telemetry_workspace_props(repo_root(), exp_id=exp_id)
+    except Exception:
+        return {}
+
+
+def cmd_telemetry(args: argparse.Namespace) -> int:
+    from . import telemetry
+
+    if args.telemetry_action == "status":
+        data = telemetry.status()
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2, sort_keys=True))
+            return 0
+        state = "on" if data["enabled"] else "off"
+        print(f"telemetry: {state} ({data['source']})")
+        print(f"path: {data['path']}")
+        print(f"install_id: {data['install_id'] or '<not created>'}")
+        print(f"endpoint: {data['endpoint']}")
+        return 0
+
+    if args.telemetry_action == "on":
+        telemetry.set_enabled(True)
+        print("Telemetry enabled.")
+        return 0
+
+    if args.telemetry_action == "off":
+        context = (
+            _current_telemetry_workspace_props()
+            if telemetry.telemetry_enabled()
+            else {}
+        )
+        sent = telemetry.disable_with_final_event(
+            properties=context
+        )
+        suffix = " (sent final opt-out event)" if sent else ""
+        print(f"Telemetry disabled.{suffix}")
+        return 0
+
+    if args.telemetry_action == "reset-id":
+        new_id = telemetry.reset_install_id()
+        print(f"Telemetry install_id reset: {new_id}")
+        return 0
+
+    if args.telemetry_action == "usecase":
+        context = (
+            _current_telemetry_workspace_props()
+            if telemetry.telemetry_enabled()
+            else {}
+        )
+        sent = telemetry.capture_usecase(
+            args.description,
+            args.tag or [],
+            properties=context,
+        )
+        if sent:
+            try:
+                _record_telemetry_usecase_tags(repo_root(), args.tag or [])
+            except Exception:
+                pass
+        print("Use case sent." if sent else "Telemetry disabled; use case not sent.")
+        return 0
+
+    if args.telemetry_action == "feedback":
+        exp_id = getattr(args, "exp_id", None)
+        context = (
+            _current_telemetry_workspace_props(exp_id=exp_id)
+            if telemetry.telemetry_enabled()
+            else {}
+        )
+        sent = telemetry.capture_feedback(
+            kind=args.kind,
+            phase=args.phase,
+            summary=args.summary,
+            expected=args.expected,
+            actual=args.actual,
+            repro=args.repro,
+            tags=args.tag or [],
+            properties=context,
+        )
+        print("Feedback sent." if sent else "Telemetry disabled; feedback not sent.")
+        return 0
+
+    raise RuntimeError(f"unknown telemetry action: {args.telemetry_action}")
+
+
 def _redact_config_value(value: Any) -> Any:
     if isinstance(value, dict):
         redacted = {}
@@ -588,6 +685,8 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     print(f"commit_strategy: {data.get('commit_strategy', 'all')}")
     print(f"default_autonomous: {str(bool(data.get('default_autonomous'))).lower()}")
     print(f"default_subagents_only: {str(bool(data.get('default_subagents_only'))).lower()}")
+    print(f"default_orchestrator: {data.get('default_orchestrator') or 'prose'}")
+    print(f"task_skills: {', '.join(data.get('task_skills') or []) or '<none>'}")
     print(f"execution_backend: {data.get('execution_backend', 'worktree')}")
     backend_config = data.get("execution_backend_config") or {}
     if backend_config:
@@ -612,6 +711,9 @@ _CONFIG_FIELD_TO_KEY: dict[str, str] = {
     "frontier-strategy": "frontier_strategy",
     "default-autonomous": "default_autonomous",
     "default-subagents-only": "default_subagents_only",
+    "per-exp-timeout": "per_exp_timeout",
+    "default-orchestrator": "default_orchestrator",
+    "task-skills": "task_skills",
 }
 
 # Workspace run-behavior defaults captured at discover time. Off by default;
@@ -679,6 +781,14 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             if attempts < 1:
                 raise RuntimeError("max-attempts must be a positive integer")
             config["max_attempts"] = attempts
+        elif args.field == "per-exp-timeout":
+            try:
+                seconds = int(args.value)
+            except ValueError:
+                raise RuntimeError("per-exp-timeout must be a positive integer (seconds)")
+            if seconds < 1:
+                raise RuntimeError("per-exp-timeout must be a positive integer (seconds)")
+            config["per_exp_timeout"] = seconds
         elif args.field == "gate":
             value = args.value.strip()
             config["gate"] = value or None
@@ -696,6 +806,17 @@ def cmd_config_set(args: argparse.Namespace) -> int:
                 config["frontier_strategy"] = fs.validate_frontier_strategy(parsed)
             except ValueError as exc:
                 raise RuntimeError(str(exc))
+        elif args.field == "default-orchestrator":
+            value = args.value.strip().lower()
+            if value not in {"prose", "workflow"}:
+                raise RuntimeError("default-orchestrator must be 'prose' or 'workflow'")
+            config["default_orchestrator"] = value
+        elif args.field == "task-skills":
+            # Free-form, comma-separated evo skill names a builder should load for
+            # this task's category (e.g. "finetuning"). Resolved once by discover,
+            # read by every executing agent (prose subagent or workflow lane).
+            names = [s.strip() for s in args.value.split(",") if s.strip()]
+            config["task_skills"] = names or None
         elif args.field in _CONFIG_BOOL_FIELDS:
             config[_CONFIG_FIELD_TO_KEY[args.field]] = _parse_onoff(args.value)
         else:
@@ -1395,8 +1516,58 @@ def _cmd_dispatch_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _descendant_pids(pid: int) -> list[int]:
+    """Best-effort descendant PIDs of `pid` (children, grandchildren, ...).
+
+    Cross-platform: `ps -eo pid=,ppid=` on POSIX, `Win32_Process` via
+    PowerShell on Windows. Returns [] on any failure (missing tool, timeout).
+    Used so `evo abort` can take down the benchmark subprocess tree, not just
+    the driver — otherwise a detached/long benchmark child (e.g. a training
+    process) survives as an orphan after the driver dies. Children are
+    captured BEFORE the parent is signalled, while the tree is still intact.
+    killpg is deliberately avoided: the driver may share the caller's process
+    group, and killing the group could take down the shell.
+    """
+    if sys.platform == "win32":
+        # Emit one "<pid> <ppid>" line per process to match the `ps` format
+        # parsed below.
+        cmd = [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process | "
+            "ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }",
+        ]
+    else:
+        cmd = ["ps", "-eo", "pid=,ppid="]
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return []
+    kids: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            p, pp = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        kids.setdefault(pp, []).append(p)
+    out_pids: list[int] = []
+    stack = [pid]
+    seen = {pid}
+    while stack:
+        for child in kids.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                out_pids.append(child)
+                stack.append(child)
+    return out_pids
+
+
 def cmd_abort(args: argparse.Namespace) -> int:
-    """SIGTERM the driver process for the current attempt of <exp_id>.
+    """SIGTERM the driver process (and its subprocess tree) for <exp_id>.
 
     Reads the driver PID stamped into attempt_state.json by `evo run` and
     sends SIGTERM. After --timeout seconds (default 5), if the process is
@@ -1407,10 +1578,12 @@ def cmd_abort(args: argparse.Namespace) -> int:
     until evo's normal failure path runs). Once the driver exits, a
     subsequent `evo run` will see the dead PID and reclaim the attempt.
 
-    Note: aborts only the driver process. If the benchmark spawned
-    workers detached via setsid/nohup, they survive — the driver was
-    coordinating them and is what `evo run` re-invocation gates on. For
-    a full process-tree kill across detached workers, see TODO #7.
+    Aborts the driver AND its descendant process tree (the benchmark/training
+    subprocess and its children), captured before the parent is signalled, so a
+    long benchmark child doesn't survive as an orphan. Workers fully detached
+    into a new session (setsid/nohup) still escape a tree walk; for those the
+    recipe must honour SIGTERM. killpg is avoided on purpose — the driver may
+    share the caller's process group.
     """
     import signal
     import time as _time
@@ -1441,37 +1614,51 @@ def cmd_abort(args: argparse.Namespace) -> int:
         return 0
     # Windows has no SIGKILL; there os.kill(pid, SIGTERM) already maps to
     # TerminateProcess (a hard kill), so SIGTERM is the forceful signal.
+    # Windows has no SIGKILL; there os.kill(pid, SIGTERM) already maps to
+    # TerminateProcess (a hard kill), so SIGTERM is the forceful signal.
     sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     sig = sigkill if args.force else signal.SIGTERM
+    # Capture the descendant tree BEFORE signalling the parent (once the driver
+    # dies, children reparent to init and the ppid links are lost).
+    kids = _descendant_pids(pid)
+    targets = [pid, *kids]
+
+    def _signal(targs: list[int], signum: int) -> None:
+        for tp in targs:
+            try:
+                os.kill(tp, signum)
+            except (ProcessLookupError, OSError):
+                pass
+
     try:
-        os.kill(pid, sig)
+        os.kill(pid, sig)  # validate the driver PID is signalable first
     except ProcessLookupError:
-        print(f"{args.exp_id}: driver PID {pid} exited before signal")
+        print(f"{args.exp_id}: driver PID {pid} exited before signal; sweeping {len(kids)} child(ren)")
+        _signal(kids, sigkill)
         return 0
     except OSError as exc:
         print(f"ERROR: failed to signal PID {pid}: {exc}", file=sys.stderr)
         return 1
+    _signal(kids, sig)  # take down the rest of the tree
+    tree_note = f" (+{len(kids)} child process(es))" if kids else ""
     if args.force:
-        print(f"{args.exp_id}: SIGKILL sent to driver PID {pid}")
+        print(f"{args.exp_id}: SIGKILL sent to driver PID {pid}{tree_note}")
         return 0
     print(
-        f"{args.exp_id}: SIGTERM sent to driver PID {pid}; "
+        f"{args.exp_id}: SIGTERM sent to driver PID {pid}{tree_note}; "
         f"waiting up to {args.timeout}s for clean exit..."
     )
     deadline = _time.time() + max(0.0, args.timeout)
     while _time.time() < deadline:
         if not _is_pid_alive(pid):
-            print(f"{args.exp_id}: driver PID {pid} exited cleanly")
-            return 0
+            break
         _time.sleep(0.25)
-    try:
-        os.kill(pid, sigkill)
-        print(
-            f"{args.exp_id}: driver PID {pid} did not exit in {args.timeout}s; "
-            f"escalated to SIGKILL"
-        )
-    except ProcessLookupError:
-        print(f"{args.exp_id}: driver PID {pid} exited during grace period")
+    alive = [tp for tp in targets if _is_pid_alive(tp)]
+    if alive:
+        _signal(alive, sigkill)
+        print(f"{args.exp_id}: escalated to SIGKILL for {len(alive)} still-alive process(es): {alive}")
+    else:
+        print(f"{args.exp_id}: driver PID {pid} and its tree exited cleanly")
     return 0
 
 
@@ -1498,6 +1685,54 @@ def _cmd_dispatch_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_preserved_artifact(root: Path, spec: str) -> dict[str, str]:
+    """Resolve `exp_id[:label]` to a preserved artifact from that experiment's
+    discard manifest (written by `_preserve_discard_artifacts`). Returns
+    {source_exp, label, path}. Category-agnostic — the artifact is whatever the
+    recipe declared (checkpoint, adapter, index, prompt, ...)."""
+    src_exp, _, label = spec.partition(":")
+    src_exp = src_exp.strip()
+    label = label.strip()
+    if not src_exp:
+        raise RuntimeError("--from-artifact requires an experiment id, e.g. exp_0007 or exp_0007:<label>")
+    exp_dir = experiments_dir_for(root, src_exp)
+    manifest = exp_dir / "artifacts" / "discarded" / "manifest.json"
+    if not manifest.exists():
+        raise RuntimeError(
+            f"no preserved artifacts for {src_exp} (expected {manifest}). "
+            f"Only experiments discarded after DECLARING artifacts have a manifest."
+        )
+    arts = (json.loads(manifest.read_text()).get("artifacts")) or []
+    if not arts:
+        raise RuntimeError(f"{src_exp} preserved no artifacts (manifest is empty).")
+    # The same artifact is recorded once per declaring source (benchmark_result,
+    # outcome.json, result.json); collapse to unique (label, stored_path) so a
+    # single logical artifact isn't mistaken for several.
+    _uniq: dict[tuple, dict] = {}
+    for a in arts:
+        _uniq.setdefault((a.get("label"), a.get("stored_path")), a)
+    arts = list(_uniq.values())
+    if label:
+        chosen = next((a for a in arts if a.get("label") == label), None)
+        if chosen is None:
+            raise RuntimeError(
+                f"{src_exp} has no preserved artifact labeled '{label}'. "
+                f"Available: {[a.get('label') for a in arts]}"
+            )
+    elif len(arts) == 1:
+        chosen = arts[0]
+    else:
+        raise RuntimeError(
+            f"{src_exp} has multiple preserved artifacts; pick one as {src_exp}:<label>. "
+            f"Available: {[a.get('label') for a in arts]}"
+        )
+    stored = chosen.get("stored_path")
+    abs_path = (exp_dir / stored).resolve(strict=False) if stored else None
+    if not abs_path or not abs_path.exists():
+        raise RuntimeError(f"preserved artifact is missing on disk: {abs_path}")
+    return {"source_exp": src_exp, "label": chosen.get("label", ""), "path": str(abs_path)}
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     root = repo_root()
     config, graph = _require_workspace(root)
@@ -1521,8 +1756,26 @@ def cmd_new(args: argparse.Namespace) -> int:
         hypothesis=args.message,
         backend_override=backend_override,
     )
+    seed = None
+    seed_spec = getattr(args, "from_artifact", None)
+    if seed_spec:
+        seed = _resolve_preserved_artifact(root, seed_spec)
+
+        def _seed(n: dict, _g: dict) -> None:
+            n["from_artifact"] = seed
+
+        update_node(root, node["id"], _seed)
     target = node_target_path(root, config, node)
-    print(json.dumps({"id": node["id"], "worktree": node["worktree"], "target": str(target)}, indent=2))
+    out = {"id": node["id"], "worktree": node["worktree"], "target": str(target)}
+    if seed:
+        out["from_artifact"] = seed
+    args.exp_id = node["id"]
+    try:
+        from evo.inject.registry import claim_current_session_exp_id
+        claim_current_session_exp_id(root, node["id"])
+    except Exception:
+        pass
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -1580,6 +1833,66 @@ def _run_command(command: str, cwd: Path, env: dict[str, str], stdout_path: Path
     return result
 
 
+def _capture_discard_time_diff(root: Path, exp_id: str, node: dict, graph: dict) -> Path | None:
+    """Capture parent..exp diff into <experiment_dir>/diff.patch before
+    delete_discarded_experiment wipes the worktree+branch.
+
+    Returns the patch path on success, None when the diff was skipped
+    (no worktree, no parent ref). Best-effort: any unexpected failure
+    is logged and swallowed so the discard itself never blocks. See
+    evo-hq/evo#57.
+    """
+    try:
+        from .core import capture_experiment_diff
+        worktree_path = Path(node.get("worktree") or "")
+        if not worktree_path.is_dir():
+            return None
+        parent_id = node.get("parent")
+        parent_node = graph["nodes"].get(parent_id) if parent_id else None
+        parent_ref = (parent_node or {}).get("commit") or (parent_node or {}).get("branch")
+        if not parent_ref:
+            return None
+        diff_text = capture_experiment_diff(
+            root, exp_id, 0, parent_ref, worktree_path,
+        )
+        # experiment_result_path -> <experiment_dir>/result.json; take its
+        # parent. Created at evo new time, but mkdir is defensive in case
+        # discard runs against a partially-initialized experiment.
+        exp_dir = experiment_result_path(root, exp_id).parent
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = exp_dir / "diff.patch"
+        patch_path.write_text(diff_text, encoding="utf-8")
+        return patch_path
+    except Exception as exc:  # noqa: BLE001
+        print(f"NOTE: failed to capture discard-time diff for {exp_id}: {exc}", file=sys.stderr)
+        return None
+
+
+def _assert_tasks_aggregated(traces_dir: Path, parsed: Any) -> None:
+    """Catch rolled-own log_task/write_result that emit per-task traces
+    but omit `tasks` from the aggregate result. The dashboard's per-task
+    panel reads outcome.benchmark.result.tasks for committed experiments
+    (no fallback to the traces dir), so these benchmarks silently render
+    "No benchmark task results recorded" even with N traces on disk.
+
+    Raises RuntimeError when the benchmark wrote 2+ per-task traces but
+    `parsed.tasks` is missing/empty. Single-trace benchmarks are exempt
+    (a benchmark that produces one aggregate measurement legitimately
+    skips the tasks array). See evo-hq/evo#56.
+    """
+    trace_count = len(list(traces_dir.glob("task_*.json")))
+    result_has_tasks = isinstance(parsed, dict) and bool(parsed.get("tasks"))
+    if trace_count > 1 and not result_has_tasks:
+        raise RuntimeError(
+            f"tasks_missing_from_result (benchmark wrote {trace_count} per-task "
+            f"traces to traces/ but result.json has no `tasks` array -- your "
+            f"write_result() is likely not aggregating per-task scores. Replace "
+            f"the rolled-own log_task/write_result with the canonical "
+            f"plugins/evo/skills/discover/references/inline_instrumentation.py "
+            f"paste-in -- it does the aggregation for you.)"
+        )
+
+
 def _finalize_result(root: Path, exp_id: str, node: dict, score: float | None, status: str, extra: dict | None = None) -> None:
     payload = {
         "experiment_id": exp_id,
@@ -1591,6 +1904,168 @@ def _finalize_result(root: Path, exp_id: str, node: dict, score: float | None, s
     if extra:
         payload.update(extra)
     atomic_write_json(experiment_result_path(root, exp_id), payload)
+
+
+def _safe_artifact_name(label: str, source: Path) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", label.strip()).strip("-._")
+    if not cleaned:
+        cleaned = source.stem or source.name or "artifact"
+    digest = hashlib.sha1(
+        str(source.resolve(strict=False)).encode("utf-8")
+    ).hexdigest()[:10]
+    suffix = source.suffix if source.is_file() else ""
+    return f"{cleaned}-{digest}{suffix}"
+
+
+def _artifact_path_within(path: Path, base: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(base.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _iter_declared_artifacts(payload: Any, source: str) -> list[dict[str, str]]:
+    if not isinstance(payload, dict):
+        return []
+    artifacts = payload.get("artifacts")
+    records: list[dict[str, str]] = []
+    if isinstance(artifacts, dict):
+        for label, path in artifacts.items():
+            if path is None:
+                continue
+            records.append({
+                "label": str(label),
+                "path": str(path),
+                "source": source,
+            })
+    elif isinstance(artifacts, list):
+        for index, item in enumerate(artifacts):
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path") or item.get("uri")
+            if path is None:
+                continue
+            label = item.get("name") or item.get("kind") or f"artifact-{index + 1}"
+            records.append({
+                "label": str(label),
+                "path": str(path),
+                "source": source,
+            })
+    return records
+
+
+def _declared_discard_artifacts(root: Path, exp_id: str, node: dict) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    benchmark_result = node.get("benchmark_result")
+    records.extend(_iter_declared_artifacts(benchmark_result, "node.benchmark_result"))
+
+    exp_dir = experiments_dir_for(root, exp_id)
+    attempts_dir = exp_dir / "attempts"
+    if not attempts_dir.exists():
+        return records
+
+    result_paths = list(attempts_dir.glob("*/result.json"))
+    result_paths.extend(attempts_dir.glob("*/outcome.json"))
+    for result_path in sorted(result_paths):
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        attempt_name = result_path.parent.name
+        benchmark = result.get("benchmark") if isinstance(result, dict) else None
+        if isinstance(benchmark, dict):
+            records.extend(_iter_declared_artifacts(
+                benchmark.get("result"),
+                f"attempts/{attempt_name}/{result_path.name}",
+            ))
+        records.extend(_iter_declared_artifacts(
+            result,
+            f"attempts/{attempt_name}/{result_path.name}",
+        ))
+
+    for trace_path in sorted(attempts_dir.glob("*/traces/*.json")):
+        try:
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        try:
+            source = str(trace_path.relative_to(exp_dir))
+        except ValueError:
+            source = str(trace_path)
+        records.extend(_iter_declared_artifacts(trace, source))
+
+    return records
+
+
+def _preserve_discard_artifacts(root: Path, node: dict) -> dict[str, Any]:
+    """Copy declared result/trace artifacts before discard removes the worktree."""
+    exp_id = node["id"]
+    raw_worktree = node.get("worktree")
+    if not raw_worktree:
+        return {"artifacts": [], "skipped": []}
+    worktree = Path(raw_worktree)
+    if not worktree.exists():
+        return {"artifacts": [], "skipped": []}
+
+    exp_dir = experiments_dir_for(root, exp_id)
+    dest_root = exp_dir / "artifacts" / "discarded"
+    copied: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    seen: dict[str, dict[str, str]] = {}
+
+    for record in _declared_discard_artifacts(root, exp_id, node):
+        raw_path = record["path"].strip()
+        if not raw_path:
+            continue
+        src = Path(raw_path)
+        if not src.is_absolute():
+            src = worktree / src
+        src_resolved = src.resolve(strict=False)
+        key = str(src_resolved)
+        if key in seen:
+            copied.append({**record, **seen[key]})
+            continue
+        if not src.exists():
+            skipped.append({**record, "reason": "missing"})
+            continue
+        if _artifact_path_within(src_resolved, exp_dir):
+            # Already durable (e.g. written to EVO_CHECKPOINT_DIR, which lives under
+            # the experiment record, not the worktree). No copy needed — but still
+            # record it as a reusable artifact so `evo new --from-artifact` can find
+            # it. (Without this, persistent artifacts were silently un-reusable.)
+            stored = str(src_resolved.relative_to(exp_dir.resolve(strict=False)))
+            saved = {"stored_path": stored, "source_path": raw_path, "already_persistent": True}
+            seen[key] = saved
+            copied.append({**record, **saved})
+            continue
+
+        dest = dest_root / _safe_artifact_name(record["label"], src)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dest, symlinks=True)
+            else:
+                shutil.copy2(src, dest)
+        except OSError as exc:
+            skipped.append({**record, "reason": f"copy_failed:{exc}"})
+            continue
+
+        stored = str(dest.relative_to(exp_dir))
+        saved = {"stored_path": stored, "source_path": raw_path}
+        seen[key] = saved
+        copied.append({**record, **saved})
+
+    if copied or skipped:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(dest_root / "manifest.json", {
+            "experiment_id": exp_id,
+            "timestamp": utc_now(),
+            "artifacts": copied,
+            "skipped": skipped,
+        })
+
+    return {"artifacts": copied, "skipped": skipped}
 
 
 def _remote_stream_journals(root: Path, exp_id: str, attempt: int) -> list[dict]:
@@ -1947,9 +2422,36 @@ def _block_if_epoch_requires_baseline(root: Path, parent_id: str, no_compare: bo
         raise RuntimeError("comparison is blocked for the current eval epoch until a new root baseline is committed")
 
 
+def _resolve_run_timeout(args: argparse.Namespace, config: dict) -> int:
+    """Resolve the effective per-experiment timeout for `evo run`.
+
+    Precedence: `--timeout N` (per-call) > workspace `per_exp_timeout`
+    (set at `evo init`) > legacy 1800s fallback (with one-line warning).
+
+    The legacy fallback exists so workspaces initialized before
+    `--per-exp-timeout` became required keep working. Run
+    `evo config set per-exp-timeout <seconds>` to silence the warning.
+    """
+    if getattr(args, "timeout", None) is not None:
+        return args.timeout
+    workspace_timeout = config.get("per_exp_timeout")
+    if workspace_timeout is not None:
+        return int(workspace_timeout)
+    print(
+        "WARN: workspace was initialized before --per-exp-timeout existed. "
+        "Using legacy default 1800s. Set explicitly via "
+        "`evo config set per-exp-timeout <seconds>` to silence this warning.",
+        file=sys.stderr,
+    )
+    return 1800
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     root = repo_root()
     config, graph = _require_workspace(root)
+    # Resolve the effective per-experiment timeout once, then write it back
+    # so every downstream `args.timeout` reference picks up the resolved value.
+    args.timeout = _resolve_run_timeout(args, config)
     node = _read_node(root, args.exp_id)
     if getattr(args, "check", False):
         if not node.get("worktree"):
@@ -1960,6 +2462,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         backend = load_backend(root, node=node, workspace_config=config)
         with workspace_executor_for(backend, root, node) as executor:
             return _cmd_run_check(args, root, config, graph, node, executor)
+
+    invalid_blocker = lineage_invalidated_by(graph, args.exp_id)
+    if invalid_blocker is not None:
+        print(
+            f"ERROR: {args.exp_id} is under invalidated lineage "
+            f"{invalid_blocker.get('id')}; branch from the best valid node "
+            f"instead. Use `evo run --check {args.exp_id}` only for forensics.",
+            file=sys.stderr,
+        )
+        return 1
 
     if node.get("status") not in (None, "pending", "active", "evaluated", "failed"):
         print(f"ERROR: {args.exp_id} has status '{node['status']}' -- cannot run again", file=sys.stderr)
@@ -2003,6 +2515,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 current_node["error"] = error_msg
 
             update_node(root, args.exp_id, _mark_failed)
+            metric = str(config.get("metric", "max"))
+            parent_score = _resolve_parent_score(graph, node["parent"])
             if attempt_n > 0:
                 _write_attempt_state(
                     root, args.exp_id, attempt_n,
@@ -2012,9 +2526,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                 _write_attempt_outcome(
                     root, args.exp_id, attempt_n, "failed",
                     node=node, started_at=started_at, error=error_msg,
-                    parent_score=_resolve_parent_score(graph, node["parent"]),
-                    metric=config.get("metric"),
+                    parent_score=parent_score,
+                    metric=metric,
                 )
+            _emit_experiment_result_telemetry(
+                root,
+                args.exp_id,
+                outcome="failed",
+                metric=metric,
+                parent_score=parent_score,
+                best_before_score=best_committed_score(graph, metric),
+                failure_type="infra",
+            )
             try:
                 from .backends import DiscardCtx as _DCtx
                 failed_node = dict(node)
@@ -2059,6 +2582,20 @@ def _runtime_env_for_attempt(
     env["EVO_ATTEMPT"] = attempt_label
     env["EVO_RESULT_PATH"] = env_result_path
     env["EVO_CHECKPOINT_DIR"] = env_checkpoint_dir
+    # Reuse path: if this experiment was created with `evo new --from-artifact`,
+    # expose the preserved artifact's path so the recipe can warm-start / retest
+    # instead of rebuilding from scratch. Category-agnostic (checkpoint/index/...).
+    try:
+        _node = (load_graph(root).get("nodes") or {}).get(exp_id) or {}
+        _seed = (_node.get("from_artifact") or {}).get("path")
+        if _seed:
+            env["EVO_SEED_ARTIFACT"] = _seed
+            # Back-compat alias: recipes that read EVO_PARENT_POLICY (warm-start
+            # source) get the same path when the experiment was seeded from a
+            # parent/prior checkpoint via `evo new --from-artifact`.
+            env["EVO_PARENT_POLICY"] = _seed
+    except Exception:
+        pass  # best-effort; never block a run on seed-env resolution
     return env
 
 
@@ -2323,6 +2860,7 @@ def _cmd_run_check(
             raise RuntimeError("missing_result_json")
         score, parsed = load_result(result_path, bench.stdout)
         benchmark_record = {"command": benchmark_cmd, "returncode": 0, "result": parsed}
+        _assert_tasks_aggregated(traces_dir, parsed)
 
         # Check that if there are multiple task trace files, then result has tasks
         if traces_dir.exists():
@@ -2366,6 +2904,14 @@ def _cmd_run_check(
             "error": error,
         }
         atomic_write_json(check_dir / "check.json", payload)
+        _emit_experiment_result_telemetry(
+            root,
+            args.exp_id,
+            outcome="check_passed" if status == "passed" else "check_failed",
+            metric=str(config.get("metric")) if config.get("metric") else None,
+            check=True,
+            failure_type=_telemetry_failure_type(error),
+        )
 
 
 def _cmd_run_impl(
@@ -2504,6 +3050,7 @@ def _cmd_run_impl(
     result_path = a_dir / "result.json"
     metric = config["metric"]
     parent_score = _resolve_parent_score(graph, node["parent"])
+    best_before_score = best_committed_score(graph, metric)
 
     # In remote mode the workspace lives inside the sandbox; the benchmark
     # writes to sandbox-local paths and we fetch artifacts back to local
@@ -2602,8 +3149,17 @@ def _cmd_run_impl(
     else:
         parent_node = _read_node(root, node["parent"])
         parent_ref = parent_node.get("commit") or parent_node["branch"]
-    diff_text = render_git_diff(
-        root, parent_ref, worktree, relative_target(config), executor=executor,
+    # Whole-repo diff against parent (covers both committed-then-run and
+    # dirty-worktree workflows). Scoping to relative_target(config) drops
+    # all source edits outside that one path -- the bug fixed by #51.
+    diff_text = capture_experiment_diff(
+        root,
+        args.exp_id,
+        attempt_n,
+        parent_ref,
+        worktree,
+        executor=executor,
+        exclude_patterns=config.get("diff_exclude_patterns"),
     )
     (a_dir / "diff.patch").write_text(diff_text, encoding="utf-8")
 
@@ -2763,6 +3319,8 @@ def _cmd_run_impl(
         )
         score, parsed = load_result(result_path, bench_stdout)
         benchmark_record = {"command": benchmark_cmd, "returncode": 0, "result": parsed}
+        _assert_tasks_aggregated(traces_dir, parsed)
+
         _write_attempt_state(
             root, args.exp_id, attempt_n,
             phase="artifacts" if remote else "benchmark",
@@ -2888,6 +3446,15 @@ def _cmd_run_impl(
                 benchmark=benchmark_record, runtime=runtime_records, gates=gate_records,
                 commit=commit, parent_score=parent_score, metric=metric,
             )
+            _emit_experiment_result_telemetry(
+                root,
+                args.exp_id,
+                outcome="committed",
+                metric=metric,
+                score=score,
+                parent_score=parent_score,
+                best_before_score=best_before_score,
+            )
             # Release the workspace lease on transition into `committed`.
             # Worktree backend: no-op. Pool backend: returns the slot to the
             # free queue. Failed and evaluated transitions retain the lease.
@@ -2922,6 +3489,16 @@ def _cmd_run_impl(
             node=node, started_at=started_at, score=score,
             benchmark=benchmark_record, runtime=runtime_records, gates=gate_records,
             parent_score=parent_score, metric=metric,
+        )
+        _emit_experiment_result_telemetry(
+            root,
+            args.exp_id,
+            outcome="evaluated",
+            metric=metric,
+            score=score,
+            parent_score=parent_score,
+            best_before_score=best_before_score,
+            failure_type="gate" if not gate_passed else None,
         )
         remaining = max_attempts - (evaluated_attempts + 1)
         suffix = f" ({remaining} attempts remaining)" if remaining > 0 else " (no attempts remaining -- retry blocked)"
@@ -2971,6 +3548,16 @@ def _cmd_run_impl(
             benchmark=benchmark_record, runtime=runtime_records, gates=gate_records,
             error=error_msg, parent_score=parent_score, metric=metric,
         )
+        _emit_experiment_result_telemetry(
+            root,
+            args.exp_id,
+            outcome="failed",
+            metric=metric,
+            score=salvaged_score,
+            parent_score=parent_score,
+            best_before_score=best_before_score,
+            failure_type=_telemetry_failure_type(error_msg),
+        )
         print(f"FAILED {args.exp_id} {exc}")
         return 1
 
@@ -2980,6 +3567,15 @@ def _record_done_result(root: Path, args: argparse.Namespace) -> int:
     node = _read_node(root, args.exp_id)
     if node.get("status") not in (None, "pending", "active", "evaluated", "failed"):
         print(f"ERROR: {args.exp_id} has status '{node['status']}' -- cannot record again", file=sys.stderr)
+        return 1
+    invalid_blocker = lineage_invalidated_by(graph, args.exp_id)
+    if invalid_blocker is not None:
+        print(
+            f"ERROR: {args.exp_id} is under invalidated lineage "
+            f"{invalid_blocker.get('id')}; cannot record a promoted result. "
+            f"Create a fresh child from the best valid node instead.",
+            file=sys.stderr,
+        )
         return 1
     # `evo done` is the manual recording path; it mirrors `evo run`'s
     # attempt-scoped artifact layout so that `evo traces` and the dashboard
@@ -3006,12 +3602,21 @@ def _record_done_result(root: Path, args: argparse.Namespace) -> int:
             current_node["score"] = args.score
         update_node(root, args.exp_id, _mark_failed)
         _finalize_result(root, args.exp_id, node, args.score, "failed", {"recorded_only": True})
+        _emit_experiment_result_telemetry(
+            root,
+            args.exp_id,
+            outcome="failed",
+            metric=str(config.get("metric")) if config.get("metric") else None,
+            score=args.score,
+            failure_type="unknown",
+        )
         print(f"RECORDED {args.exp_id} score={args.score} (no compare)")
         return 0
 
     _block_if_epoch_requires_baseline(root, node["parent"], no_compare=False)
     parent_score = _resolve_parent_score(graph, node["parent"])
     metric = config["metric"]
+    best_before_score = best_committed_score(graph, metric)
     keep = compare_scores(metric, args.score, parent_score)
     if config.get("comparison_blocked") and node["parent"] == "root":
         mark_comparison_blocked(root, False)
@@ -3031,6 +3636,15 @@ def _record_done_result(root: Path, args: argparse.Namespace) -> int:
         _lb(root, node=committed_node, workspace_config=config).release_lease(
             _DCtx(root=root, node=committed_node)
         )
+    _emit_experiment_result_telemetry(
+        root,
+        args.exp_id,
+        outcome=status,
+        metric=metric,
+        score=args.score,
+        parent_score=parent_score,
+        best_before_score=best_before_score,
+    )
     print(f"{status.upper()} {args.exp_id} {args.score}")
     return 0
 
@@ -3085,12 +3699,34 @@ def cmd_discard(args: argparse.Namespace) -> int:
             f"Discard or commit-and-prune those first."
         )
 
+    fclass = getattr(args, "failure_class", None)
+
     def _mark(current_node: dict, _graph: dict) -> None:
         current_node["status"] = "discarded"
         current_node["discard_reason"] = args.reason
+        if fclass:
+            current_node["failure_class"] = fclass
 
     update_node(root, args.exp_id, _mark)
-    _finalize_result(root, args.exp_id, node, node.get("score"), "discarded", {"reason": args.reason})
+    preservation = _preserve_discard_artifacts(root, node)
+    result_extra: dict[str, Any] = {"reason": args.reason}
+    if fclass:
+        result_extra["failure_class"] = fclass
+    if preservation["artifacts"]:
+        result_extra["preserved_artifacts"] = preservation["artifacts"]
+        result_extra["artifact_manifest"] = "artifacts/discarded/manifest.json"
+    _finalize_result(root, args.exp_id, node, node.get("score"), "discarded", result_extra)
+
+    _capture_discard_time_diff(root, args.exp_id, node, graph)
+    _emit_branch_closed_telemetry(
+        root,
+        args.exp_id,
+        node,
+        close_type="discard",
+        reason=args.reason,
+        failure_class=fclass,
+    )
+
     delete_discarded_experiment(root, node)
     print(f"DISCARDED {args.exp_id}: {args.reason}")
     return 0
@@ -3117,6 +3753,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         def _unprune(current_node: dict, _graph: dict) -> None:
             current_node["status"] = "committed"
             current_node["pruned_reason"] = None
+            current_node["prune_kind"] = None
 
         update_node(root, args.exp_id, _unprune)
         print(f"RESTORED {args.exp_id}: pruned → committed")
@@ -3199,11 +3836,32 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
 def cmd_prune(args: argparse.Namespace) -> int:
     root = repo_root()
+    config, graph = _require_workspace(root)
+    prune_kind = (
+        PRUNE_KIND_INVALID
+        if bool(getattr(args, "invalid", False))
+        else PRUNE_KIND_EXHAUSTED
+    )
+    metric = str(config.get("metric", "max"))
+    spine = best_spine_ids(graph, metric)
+    if (
+        prune_kind == PRUNE_KIND_INVALID
+        and args.exp_id in spine
+        and not bool(getattr(args, "yes", False))
+    ):
+        best_node = best_committed_node(graph, metric)
+        best_id = best_node.get("id") or "current best"
+        raise RuntimeError(
+            f"{args.exp_id} is on the current best valid spine ending at {best_id}. "
+            f"Invalidating it can change the selected best result and exclude "
+            f"descendants. If this is intentional, rerun with "
+            f"`evo prune {args.exp_id} --invalid --yes --reason \"...\"`."
+        )
 
     def _mark(current_node: dict, _graph: dict) -> None:
         # Prune accepts committed AND evaluated nodes:
-        # - committed: "this lineage is exhausted; preserve the commit but
-        #   stop branching from here"
+        # - exhausted: preserve the result but stop branching from here
+        # - invalid: remove this result and descendants from best/ship
         # - evaluated: "this didn't promote, but the score is informative;
         #   don't branch from it either"
         # Active/failed/discarded/pruned all stay forbidden.
@@ -3214,17 +3872,27 @@ def cmd_prune(args: argparse.Namespace) -> int:
             )
         current_node["status"] = "pruned"
         current_node["pruned_reason"] = args.reason
+        current_node["prune_kind"] = prune_kind
 
     update_node(root, args.exp_id, _mark)
+    _emit_branch_closed_telemetry(
+        root,
+        args.exp_id,
+        graph["nodes"].get(args.exp_id, {"id": args.exp_id}),
+        close_type="prune",
+        reason=args.reason,
+        prune_kind=prune_kind,
+    )
+    kind_suffix = f" [{prune_kind}]"
     if args.reason is None:
         print(
             f"WARNING: pruning {args.exp_id} without a reason "
             f"— pass `--reason \"...\"` to record one.",
             file=sys.stderr,
         )
-        print(f"PRUNED {args.exp_id}")
+        print(f"PRUNED {args.exp_id}{kind_suffix}")
     else:
-        print(f"PRUNED {args.exp_id}: {args.reason}")
+        print(f"PRUNED {args.exp_id}{kind_suffix}: {args.reason}")
     return 0
 
 
@@ -3457,14 +4125,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     config, graph = _require_workspace(root)
     metric = config["metric"]
     nodes = [node for node in graph["nodes"].values() if node["id"] != "root"]
-    committed = [node for node in nodes if node.get("status") == "committed"]
-    best = None
-    if committed:
-        scores = [float(node["score"]) for node in committed if node.get("score") is not None]
-        best = max(scores) if metric == "max" else min(scores)
+    best = best_committed_score(graph, metric)
     print(
         f"metric={metric} epoch={config.get('current_eval_epoch', 1)} "
-        f"experiments={len(nodes)} committed={sum(1 for n in nodes if n.get('status') == 'committed')} "
+        f"experiments={len(nodes)} committed={sum(1 for n in nodes if effective_status(graph, n) == 'committed')} "
         f"evaluated={sum(1 for n in nodes if n.get('status') == 'evaluated')} "
         f"discarded={sum(1 for n in nodes if n.get('status') == 'discarded')} "
         f"failed={sum(1 for n in nodes if n.get('status') == 'failed')} "
@@ -4160,7 +4824,18 @@ def cmd_install(args: argparse.Namespace) -> int:
     """
     from . import host_install
     try:
-        return host_install.install(args.host, args)
+        rc = host_install.install(args.host, args)
+        if rc == 0:
+            try:
+                from . import telemetry
+                if telemetry.telemetry_enabled():
+                    print(
+                        "evo sends anonymous usage stats to improve the tool. "
+                        "Turn it off anytime with `evo telemetry off`."
+                    )
+            except Exception:
+                pass
+        return rc
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -4388,23 +5063,60 @@ def cmd_direct(args: argparse.Namespace) -> int:
     return 0
 
 
-# Hard cap so an orchestrator that miscomputes --timeout can't block its
-# session for hours. 1 hour matches the user's stated upper bound; users
-# who legitimately need longer should issue multiple `evo wait` calls.
-_WAIT_TIMEOUT_CAP = 3600
+# Default timeout for `evo wait`: 1 hour. Hard ceiling: 24h to prevent
+# runaway waits if the orchestrator miscomputes a duration.
+_WAIT_TIMEOUT_DEFAULT = 3600
+_WAIT_TIMEOUT_CAP = 24 * 3600
 
 
-def _wait_timeout_seconds(raw: float | int) -> int:
-    """Clamp the user-supplied timeout into [1, 3600]. Test seam."""
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        n = _WAIT_TIMEOUT_CAP
+def _wait_timeout_seconds(raw: float | int | str) -> int:
+    """Parse and clamp the user-supplied timeout into [1, 24h]. Test seam.
+
+    Accepts seconds as int/float, or duration strings like '60m', '2h'.
+    """
+    n = _parse_duration_seconds(raw, default=_WAIT_TIMEOUT_DEFAULT)
     if n < 1:
         return 1
     if n > _WAIT_TIMEOUT_CAP:
         return _WAIT_TIMEOUT_CAP
     return n
+
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|m|min|mins|h|hr|hrs)?\s*$")
+
+
+def _parse_duration_seconds(raw: Any, default: int) -> int:
+    """Convert raw (int/float seconds or '60m'/'2h'/'30s') to integer seconds.
+
+    Returns `default` on parse failure. Used by --timeout, --stall-threshold,
+    and --poll-interval so they accept the same human-friendly forms.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, (int, float)):
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+    if isinstance(raw, str):
+        m = _DURATION_RE.match(raw)
+        if not m:
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                return default
+        value = float(m.group(1))
+        unit = (m.group(2) or "s").lower()
+        if unit in ("s", "sec", "secs"):
+            mult = 1
+        elif unit in ("m", "min", "mins"):
+            mult = 60
+        elif unit in ("h", "hr", "hrs"):
+            mult = 3600
+        else:
+            mult = 1
+        return int(value * mult)
+    return default
 
 
 def _experiments_dir_snapshot(run_dir: Path) -> dict[str, float]:
@@ -4433,6 +5145,26 @@ def _experiments_dir_snapshot(run_dir: Path) -> dict[str, float]:
     except OSError:
         pass
     return out
+
+
+def _ideator_proposals_snapshot(run_dir: Path) -> tuple[float, int]:
+    """Snapshot the ideator proposals.jsonl as (mtime, line_count).
+
+    Returns (0.0, 0) when the file doesn't exist yet. Each ideator subagent
+    appends one JSON line per proposal at the end of its run; line growth
+    is the completion signal. mtime is included so a same-line-count
+    rewrite (rare) still wakes wait.
+    """
+    f = run_dir / "ideator" / "proposals.jsonl"
+    if not f.is_file():
+        return (0.0, 0)
+    try:
+        stat = f.stat()
+        # Cheap line count -- proposals.jsonl is small (KBs, not MBs)
+        line_count = sum(1 for _ in f.open("rb"))
+        return (stat.st_mtime, line_count)
+    except OSError:
+        return (0.0, 0)
 
 
 def _describe_change(before: dict[str, float], after: dict[str, float]) -> str:
@@ -4466,6 +5198,162 @@ def _describe_change(before: dict[str, float], after: dict[str, float]) -> str:
         exp_id = first.split("/", 1)[0]
         return f"updated: {exp_id}"
     return "experiments dir changed"
+
+
+# --- evo wait: process / log / gpu probes --------------------------------
+# These back the extended `--for` surface (process=<pid>, log-growth=<path>,
+# gpu-active, gpu-idle). Pure functions; cmd_wait orchestrates the polling.
+
+def _process_alive(pid: int) -> bool:
+    """Liveness check via `os.kill(pid, 0)`. Does not signal the process.
+
+    Returns False when the pid is dead, never existed, or is owned by a
+    different user (EPERM). EPERM is treated as "alive" since the process
+    exists -- the caller just can't signal it.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists, owned by a different user.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _log_size(path: Path) -> int:
+    """File size in bytes, 0 if missing or unreadable."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _log_last_line(path: Path, max_bytes: int = 4096) -> str:
+    """Return the last newline-terminated line of the log, or '' on failure.
+
+    Reads the trailing `max_bytes` only -- safe to call on multi-GB logs.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size <= 0:
+        return ""
+    try:
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(-max_bytes, os.SEEK_END)
+            tail = fh.read()
+    except OSError:
+        return ""
+    # Strip a trailing newline so the last printed line isn't an empty string.
+    tail = tail.rstrip(b"\r\n")
+    if not tail:
+        return ""
+    last_nl = tail.rfind(b"\n")
+    line = tail[last_nl + 1:] if last_nl >= 0 else tail
+    try:
+        return line.decode("utf-8", errors="replace")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _nvidia_smi_query() -> dict[str, Any] | None:
+    """Query nvidia-smi for utilization + memory. Returns None if unavailable.
+
+    Aggregates across all visible GPUs: util is the max (so any active GPU
+    keeps the host marked active), memory is the sum. Returns None when
+    `nvidia-smi` isn't on PATH or the call fails.
+    """
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    util = 0
+    mem_used = 0
+    seen = False
+    for line in out.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            u = int(parts[0])
+            m = int(parts[1])
+        except ValueError:
+            continue
+        util = max(util, u)
+        mem_used += m
+        seen = True
+    if not seen:
+        return None
+    return {"util": util, "mem_used_mb": mem_used}
+
+
+def _parse_wait_for(
+    raw_for: list[str] | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Parse the list of --for values into a list of condition descriptors.
+
+    Returns (conditions, error). `error` is set on the first malformed entry
+    and `conditions` is whatever was successfully parsed up to that point.
+
+    Each condition is a dict with `kind` and any kind-specific fields.
+    Valid kinds: experiments, ideators, process, log_growth, gpu_active,
+    gpu_idle.
+    """
+    conditions: list[dict[str, Any]] = []
+    if not raw_for:
+        return conditions, None
+    for spec in raw_for:
+        s = (spec or "").strip()
+        if not s:
+            continue
+        if s == "experiments":
+            conditions.append({"kind": "experiments"})
+        elif s == "ideators":
+            conditions.append({"kind": "ideators"})
+        elif s == "gpu-active":
+            conditions.append({"kind": "gpu_active"})
+        elif s == "gpu-idle":
+            conditions.append({"kind": "gpu_idle"})
+        elif s.startswith("process="):
+            arg = s[len("process="):].strip()
+            try:
+                pid = int(arg)
+            except ValueError:
+                return conditions, f"--for process=<pid>: invalid pid {arg!r}"
+            if pid <= 0:
+                return conditions, f"--for process=<pid>: pid must be positive, got {pid}"
+            conditions.append({"kind": "process", "pid": pid})
+        elif s.startswith("log-growth="):
+            arg = s[len("log-growth="):].strip()
+            if not arg:
+                return conditions, "--for log-growth=<path>: path is required"
+            conditions.append({"kind": "log_growth", "path": Path(arg)})
+        else:
+            return (
+                conditions,
+                f"--for {s!r}: unknown form; expected one of "
+                "experiments, ideators, process=<pid>, log-growth=<path>, "
+                "gpu-active, gpu-idle",
+            )
+    return conditions, None
 
 
 def _halt_discard_active(root: Path) -> tuple[list[str], list[tuple[str, str]]]:
@@ -4625,9 +5513,8 @@ def cmd_autonomous(args: argparse.Namespace) -> int:
 
     Autonomous mode enables the always-fire stop nudge: at every turn
     boundary the orchestrator is re-prompted to keep driving the optimize
-    loop, instead of stopping. It is opt-in — the orchestrator runs
-    `evo autonomous on` when /optimize is invoked with the `autonomous`
-    param. A plain /optimize keeps the policy gate but stops naturally.
+    loop, instead of stopping. The optimize skill arms it by default unless
+    the user or stored config explicitly resolves autonomous off.
     `evo autonomous off` (and `evo exit-optimize-mode`) disarm it.
     """
     from .inject.registry import detect_session, mark_autonomous, unmark_autonomous
@@ -4684,9 +5571,8 @@ def cmd_subagents_only(args: argparse.Namespace) -> int:
 
     When armed, the policy deny-gate blocks the orchestrator from editing
     files / running experiments by hand — only subagents do (the
-    delegate-to-subagents discipline). Opt-in: the orchestrator runs
-    `evo subagents-only on` when /optimize is invoked with the
-    `subagents-only` param. A plain /optimize ALLOWS orchestrator edits.
+    delegate-to-subagents discipline). The optimize skill arms it by default
+    unless the user or stored config explicitly resolves subagents-only off.
     `evo subagents-only off` (and `evo exit-optimize-mode`) disarm it.
     """
     from .inject.registry import (
@@ -4731,50 +5617,355 @@ def cmd_subagents_only(args: argparse.Namespace) -> int:
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
-    """Block until any experiment reaches a terminal state, or --timeout.
+    """Block until a `--for` condition matches, or `--timeout` elapses.
 
-    Wakes on outcome.json appearing (committed / evaluated / failed) or
-    an experiment dir vanishing (discarded). Per-task trace flushes and
-    other in-flight writes are ignored — only terminal transitions count.
+    Default (no `--for`) watches BOTH experiments and ideators in the
+    active run, wakes on whichever fires first:
+      - experiments: outcome.json appearing (committed/evaluated/failed)
+        or an experiment dir vanishing (discarded).
+      - ideators: new lines appended to `<run>/ideator/proposals.jsonl`.
 
-    Returns 0 on detected transition with a one-line summary on stdout,
-    124 (POSIX timeout convention) on timeout. Polls every 1s.
+    Extended conditions (combine freely; any match wakes wait):
+      --for process=<pid>     wake when the pid is no longer alive.
+      --for log-growth=<path> wake when the file's size stops growing for
+                              `--stall-threshold` seconds (default 2m).
+                              Initial absence counts as stalled.
+      --for gpu-active        wake when nvidia-smi reports util > 0.
+      --for gpu-idle          wake when nvidia-smi reports util == 0 for
+                              `--stall-threshold` consecutive seconds.
 
-    Intended for the optimize orchestrator: after spawning N subagents in
-    parallel, call `evo wait` to block until any of them finishes (commit,
-    discard, fail — whichever happens first surfaces) instead of writing
-    ad-hoc polling loops.
+    `--count N` (requires --for experiments or --for ideators alone)
+    blocks until N items of that kind have landed since wait started.
+
+    `--json` emits a structured exit record on stdout with
+    `exit_reason`, per-condition state, and `waited_seconds`. The
+    non-JSON form prints a one-line summary.
+
+    Exit 0 on any match. Exit 124 (POSIX timeout convention) on
+    `--timeout`. Exit 2 on argument errors.
     """
-    try:
-        root = repo_root()
-    except Exception:  # noqa: BLE001 — repo_root raises on non-git cwd
-        print("ERROR: not in an evo workspace", file=sys.stderr)
+    # Parse --for first so we can decide whether this invocation needs an
+    # evo workspace at all. process / log-growth / gpu-* watch external
+    # state and don't read or write anything under .evo/.
+    raw_for = list(getattr(args, "wait_for", []) or [])
+    conditions, parse_err = _parse_wait_for(raw_for)
+    if parse_err is not None:
+        print(f"ERROR: {parse_err}", file=sys.stderr)
         return 2
-    if not (root / ".evo").exists():
-        print("ERROR: not in an evo workspace", file=sys.stderr)
-        return 2
-    # Locate the active run dir (lexicographically last run_*).
-    evo_dir = root / ".evo"
-    runs = sorted(p for p in evo_dir.iterdir() if p.is_dir() and p.name.startswith("run_"))
-    if not runs:
-        print("ERROR: no run dir under .evo/", file=sys.stderr)
-        return 2
-    run_dir = runs[-1]
 
-    timeout = _wait_timeout_seconds(getattr(args, "timeout", _WAIT_TIMEOUT_CAP))
+    # Backwards-compat: no --for flags means watch experiments + ideators
+    # together (the original behaviour). That implicit default still needs
+    # a workspace; the explicit non-workspace watches (process, log-growth,
+    # gpu-*) do not.
+    if not conditions:
+        conditions = [{"kind": "experiments"}, {"kind": "ideators"}]
+        implicit_both = True
+    else:
+        implicit_both = False
 
-    baseline = _experiments_dir_snapshot(run_dir)
-    deadline = time.time() + timeout
-    poll_interval = 1.0
+    needs_workspace = any(
+        c["kind"] in ("experiments", "ideators") for c in conditions
+    )
+    root: Path | None = None
+    if needs_workspace:
+        try:
+            root = repo_root()
+        except Exception:  # noqa: BLE001 — repo_root raises on non-git cwd
+            print(
+                "ERROR: not in an evo workspace "
+                "(required for --for experiments|ideators)",
+                file=sys.stderr,
+            )
+            return 2
+        if not (root / ".evo").exists():
+            print(
+                "ERROR: not in an evo workspace "
+                "(required for --for experiments|ideators)",
+                file=sys.stderr,
+            )
+            return 2
+
+    timeout = _wait_timeout_seconds(getattr(args, "timeout", _WAIT_TIMEOUT_DEFAULT))
+    stall_threshold = _parse_duration_seconds(
+        getattr(args, "stall_threshold", None), default=120,
+    )
+    if stall_threshold < 1:
+        stall_threshold = 1
+    poll_interval = _parse_duration_seconds(
+        getattr(args, "poll_interval", None), default=5,
+    )
+    if poll_interval < 1:
+        poll_interval = 1
+    json_out = bool(getattr(args, "json_out", False))
+
+    count_raw = getattr(args, "count", None)
+    count = max(1, int(count_raw or 1)) if count_raw is not None else 1
+    # --count is only meaningful with a single experiments-or-ideators wait.
+    if count_raw is not None and int(count_raw or 1) > 1:
+        kinds = [c["kind"] for c in conditions]
+        if len(kinds) != 1 or kinds[0] not in ("experiments", "ideators"):
+            print(
+                "ERROR: --count > 1 requires exactly one --for "
+                "experiments|ideators (otherwise ambiguous which kind to count)",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Locate the active run dir (lexicographically last run_*) when a
+    # workspace-anchored condition needs it. process / log-growth / gpu-*
+    # conditions don't require a workspace at all (root is None then).
+    run_dir = None
+    if root is not None:
+        evo_dir = root / ".evo"
+        runs = sorted(
+            p for p in evo_dir.iterdir()
+            if p.is_dir() and p.name.startswith("run_")
+        )
+        needs_run_dir = any(
+            c["kind"] in ("experiments", "ideators") for c in conditions
+        )
+        if needs_run_dir and not runs:
+            print("ERROR: no run dir under .evo/", file=sys.stderr)
+            return 2
+        run_dir = runs[-1] if runs else None
+
+    # Baseline state per condition.
+    started_at = time.time()
+    for c in conditions:
+        kind = c["kind"]
+        if kind == "experiments":
+            c["baseline"] = _experiments_dir_snapshot(run_dir) if run_dir else {}
+        elif kind == "ideators":
+            mtime, lines = (
+                _ideator_proposals_snapshot(run_dir) if run_dir else (0.0, 0)
+            )
+            c["base_mtime"] = mtime
+            c["base_lines"] = lines
+        elif kind == "process":
+            c["initial_alive"] = _process_alive(int(c["pid"]))
+        elif kind == "log_growth":
+            path = c["path"]
+            c["last_size"] = _log_size(path)
+            c["last_growth_ts"] = started_at
+        elif kind == "gpu_active":
+            c["last_seen_active_ts"] = None
+        elif kind == "gpu_idle":
+            c["last_seen_active_ts"] = started_at
+            # Track whether nvidia-smi is reachable; if not, skip cleanly.
+            probe = _nvidia_smi_query()
+            c["nvidia_smi_available"] = probe is not None
+
+    def _gpu_snapshot() -> dict[str, Any] | None:
+        return _nvidia_smi_query()
+
+    def _emit_result(
+        exit_reason: str,
+        triggering: dict[str, Any] | None,
+        rc: int,
+    ) -> int:
+        waited = int(time.time() - started_at)
+        if json_out:
+            payload: dict[str, Any] = {
+                "exit_reason": exit_reason,
+                "waited_seconds": waited,
+            }
+            # Attach freshest probe data per condition so callers can
+            # inspect the state regardless of which one fired.
+            for c in conditions:
+                kind = c["kind"]
+                if kind == "process":
+                    pid = int(c["pid"])
+                    payload["process"] = {
+                        "pid": pid,
+                        "alive": _process_alive(pid),
+                        # Without being the parent we cannot reap a
+                        # real exit_code; document that honestly.
+                        "exit_code": None,
+                    }
+                elif kind == "log_growth":
+                    path = c["path"]
+                    payload["log"] = {
+                        "path": str(path),
+                        "size": _log_size(path),
+                        "grew_in_last_window": (
+                            _log_size(path) > int(c.get("last_size", 0))
+                        ),
+                        "last_line": _log_last_line(path),
+                    }
+                elif kind in ("gpu_active", "gpu_idle"):
+                    snap = _gpu_snapshot()
+                    if snap is None:
+                        payload["gpu"] = {"note": "nvidia-smi unavailable"}
+                    else:
+                        payload["gpu"] = snap
+            if triggering is not None:
+                payload["triggered_by"] = triggering
+            print(json.dumps(payload))
+        else:
+            if triggering:
+                detail = triggering.get("summary") or triggering.get("kind", "")
+                print(f"[evo wait] {exit_reason}: {detail}")
+            else:
+                print(f"[evo wait] {exit_reason} after {waited}s")
+        return rc
+
+    # If conditions are already satisfied before the first poll (e.g.
+    # process is already dead, log is already missing), fire immediately.
+    # `experiments`/`ideators` are change-based and intentionally skip
+    # this early-fire pass.
+    early = _evaluate_immediate(conditions, stall_threshold, started_at)
+    if early is not None:
+        return _emit_result(early["exit_reason"], early, 0)
+
+    deadline = started_at + timeout
     while time.time() < deadline:
         time.sleep(poll_interval)
-        now = _experiments_dir_snapshot(run_dir)
-        if now != baseline:
-            summary = _describe_change(baseline, now)
-            print(f"[evo wait] change detected: {summary}")
-            return 0
-    print(f"[evo wait] timed out after {timeout}s with no experiment activity")
-    return 124
+        now = time.time()
+        for c in conditions:
+            kind = c["kind"]
+            if kind == "experiments":
+                if run_dir is None:
+                    continue
+                snap = _experiments_dir_snapshot(run_dir)
+                if snap != c["baseline"]:
+                    summary = _describe_change(c["baseline"], snap)
+                    return _emit_result(
+                        "experiments-changed",
+                        {"kind": "experiments", "summary": summary},
+                        0,
+                    )
+            elif kind == "ideators":
+                if run_dir is None:
+                    continue
+                _, now_lines = _ideator_proposals_snapshot(run_dir)
+                new_proposals = now_lines - int(c["base_lines"])
+                if new_proposals >= count:
+                    return _emit_result(
+                        "ideators-landed",
+                        {
+                            "kind": "ideators",
+                            "summary": f"{new_proposals} new ideator proposal(s) landed",
+                            "new_proposals": new_proposals,
+                        },
+                        0,
+                    )
+            elif kind == "process":
+                pid = int(c["pid"])
+                if not _process_alive(pid):
+                    return _emit_result(
+                        "process-exited",
+                        {"kind": "process", "pid": pid,
+                         "summary": f"pid {pid} no longer alive"},
+                        0,
+                    )
+            elif kind == "log_growth":
+                path = c["path"]
+                size = _log_size(path)
+                if size > int(c["last_size"]):
+                    c["last_size"] = size
+                    c["last_growth_ts"] = now
+                    continue
+                if now - float(c["last_growth_ts"]) >= stall_threshold:
+                    return _emit_result(
+                        "log-stalled",
+                        {
+                            "kind": "log_growth",
+                            "summary": (
+                                f"{path} stalled at {size}B for "
+                                f">={stall_threshold}s"
+                            ),
+                            "path": str(path),
+                            "size": size,
+                        },
+                        0,
+                    )
+            elif kind == "gpu_active":
+                snap = _gpu_snapshot()
+                if snap is None:
+                    # nvidia-smi missing -- skip, surface in JSON result.
+                    continue
+                if snap.get("util", 0) > 0:
+                    return _emit_result(
+                        "gpu-active",
+                        {"kind": "gpu_active",
+                         "summary": f"gpu util={snap['util']}%",
+                         "gpu": snap},
+                        0,
+                    )
+            elif kind == "gpu_idle":
+                if not c.get("nvidia_smi_available"):
+                    # Re-probe in case nvidia-smi became available; otherwise
+                    # this condition can never fire and the wait will time out.
+                    probe = _gpu_snapshot()
+                    if probe is None:
+                        continue
+                    c["nvidia_smi_available"] = True
+                snap = _gpu_snapshot()
+                if snap is None:
+                    continue
+                if snap.get("util", 0) > 0:
+                    c["last_seen_active_ts"] = now
+                    continue
+                if now - float(c["last_seen_active_ts"]) >= stall_threshold:
+                    return _emit_result(
+                        "gpu-idle",
+                        {"kind": "gpu_idle",
+                         "summary": (
+                             f"gpu idle for >={stall_threshold}s (util=0)"
+                         ),
+                         "gpu": snap},
+                        0,
+                    )
+
+    # Timed out. Surface partial progress for ideator counts when relevant.
+    if (
+        count_raw is not None
+        and count > 1
+        and len(conditions) == 1
+        and conditions[0]["kind"] == "ideators"
+        and run_dir is not None
+    ):
+        _, now_lines = _ideator_proposals_snapshot(run_dir)
+        new_proposals = now_lines - int(conditions[0]["base_lines"])
+        if new_proposals > 0 and not json_out:
+            print(
+                f"[evo wait] timed out after {timeout}s with {new_proposals}/"
+                f"{count} ideator proposals (partial)"
+            )
+            return 124
+
+    if not json_out:
+        kinds = ", ".join(sorted({c["kind"] for c in conditions}))
+        if implicit_both:
+            kinds = "experiment or ideator"
+        print(f"[evo wait] timed out after {timeout}s with no {kinds} activity")
+    return _emit_result("timed-out", None, 124) if json_out else 124
+
+
+def _evaluate_immediate(
+    conditions: list[dict[str, Any]], stall_threshold: int, started_at: float,
+) -> dict[str, Any] | None:
+    """Check whether any non-change-based condition is already satisfied.
+
+    `process=<pid>` fires immediately if the pid is already dead.
+    `log-growth=<path>` does NOT fire on absence -- we treat a missing log
+    as "size 0, waiting for it to appear and grow" so a wait launched
+    before the log file exists doesn't return instantly.
+
+    Change-based conditions (experiments/ideators) and stall-window
+    conditions (gpu-idle) never satisfy at t=0; they need a poll.
+    """
+    for c in conditions:
+        if c["kind"] == "process":
+            pid = int(c["pid"])
+            if not _process_alive(pid):
+                return {
+                    "exit_reason": "process-exited",
+                    "kind": "process",
+                    "pid": pid,
+                    "summary": f"pid {pid} was already not alive",
+                }
+    return None
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
@@ -4926,6 +6117,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="commit policy for `evo run`. Default: 'all'. Override only "
              "if you know why.",
     )
+    init_p.add_argument(
+        "--per-exp-timeout",
+        type=int,
+        required=True,
+        help="Per-experiment wall-clock timeout in seconds. Becomes the workspace "
+             "default for `evo run`; override per-call with `evo run --timeout N`. "
+             "Pick based on expected benchmark cost (e.g. 3600 for a 4B LoRA SFT + "
+             "eval). If unsure, time the benchmark locally once and use ~2x that.",
+    )
     init_p.add_argument("--port", type=int, default=8080)
     init_p.set_defaults(func=cmd_init)
 
@@ -4958,6 +6158,43 @@ def build_parser() -> argparse.ArgumentParser:
     defaults_set_p.add_argument("value", help="on or off")
     defaults_set_p.set_defaults(func=cmd_defaults)
 
+    telemetry_p = sub.add_parser(
+        "telemetry",
+        help="show or update anonymous usage telemetry settings",
+    )
+    telemetry_sub = telemetry_p.add_subparsers(dest="telemetry_action", required=True)
+    telemetry_status_p = telemetry_sub.add_parser("status", help="show telemetry status")
+    telemetry_status_p.add_argument("--json", action="store_true", help="emit JSON")
+    telemetry_status_p.set_defaults(func=cmd_telemetry)
+    telemetry_on_p = telemetry_sub.add_parser("on", help="enable telemetry globally")
+    telemetry_on_p.set_defaults(func=cmd_telemetry)
+    telemetry_off_p = telemetry_sub.add_parser("off", help="disable telemetry globally")
+    telemetry_off_p.set_defaults(func=cmd_telemetry)
+    telemetry_reset_p = telemetry_sub.add_parser(
+        "reset-id", help="rotate the anonymous telemetry install id"
+    )
+    telemetry_reset_p.set_defaults(func=cmd_telemetry)
+    telemetry_usecase_p = telemetry_sub.add_parser(
+        "usecase",
+        help="send a public-safe use-case description and open-ended tags",
+    )
+    telemetry_usecase_p.add_argument("--description", required=True)
+    telemetry_usecase_p.add_argument("--tag", action="append", default=[])
+    telemetry_usecase_p.set_defaults(func=cmd_telemetry)
+    telemetry_feedback_p = telemetry_sub.add_parser(
+        "feedback",
+        help="send anonymous public-safe feedback about evo behavior",
+    )
+    telemetry_feedback_p.add_argument("--kind", required=True)
+    telemetry_feedback_p.add_argument("--phase", required=True)
+    telemetry_feedback_p.add_argument("--summary", required=True)
+    telemetry_feedback_p.add_argument("--expected", required=True)
+    telemetry_feedback_p.add_argument("--actual", required=True)
+    telemetry_feedback_p.add_argument("--repro", required=True)
+    telemetry_feedback_p.add_argument("--exp-id", help="optional related experiment id")
+    telemetry_feedback_p.add_argument("--tag", action="append", default=[])
+    telemetry_feedback_p.set_defaults(func=cmd_telemetry)
+
     config_p = sub.add_parser(
         "config",
         help="mutate workspace configuration",
@@ -4980,6 +6217,9 @@ def build_parser() -> argparse.ArgumentParser:
             "frontier-strategy",
             "default-autonomous",
             "default-subagents-only",
+            "per-exp-timeout",
+            "default-orchestrator",
+            "task-skills",
         ],
     )
     config_set_p.add_argument(
@@ -4988,7 +6228,8 @@ def build_parser() -> argparse.ArgumentParser:
             "field value. For frontier-strategy pass the kind (e.g. 'argmax', "
             "'epsilon_greedy') or a JSON object like '{\"kind\": ..., \"params\": {...}}'. "
             "For gate pass the command string (empty string clears it). For "
-            "default-autonomous / default-subagents-only pass on or off."
+            "default-autonomous / default-subagents-only pass on or off. For "
+            "default-orchestrator pass 'prose' or 'workflow'."
         ),
     )
     config_set_p.set_defaults(func=cmd_config)
@@ -5009,6 +6250,9 @@ def build_parser() -> argparse.ArgumentParser:
             "frontier-strategy",
             "default-autonomous",
             "default-subagents-only",
+            "per-exp-timeout",
+            "default-orchestrator",
+            "task-skills",
         ],
     )
     config_get_p.add_argument("--json", action="store_true",
@@ -5123,11 +6367,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="shorthand for remote backend selection. Examples: modal, "
              "ssh:user@host, my_pkg.providers:Provider.",
     )
+    new_p.add_argument(
+        "--from-artifact",
+        dest="from_artifact",
+        help="seed this experiment from a PRESERVED artifact of a prior "
+             "(usually discarded) experiment: `exp_0007` or `exp_0007:<label>`. "
+             "Resolves the artifact from that experiment's discard manifest and "
+             "exposes its absolute path to the recipe as EVO_SEED_ARTIFACT so it "
+             "can warm-start / eval-retest instead of rebuilding from scratch. "
+             "Category-agnostic: the artifact is whatever the recipe declared "
+             "(checkpoint, adapter, index, prompt, ...).",
+    )
     new_p.set_defaults(func=cmd_new)
 
     run_p = sub.add_parser("run")
     run_p.add_argument("exp_id")
-    run_p.add_argument("--timeout", type=int, default=1800)
+    run_p.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Per-call override of workspace `per_exp_timeout`. If omitted, "
+             "uses the workspace's `per_exp_timeout` (set at `evo init`). "
+             "Workspaces initialized before `--per-exp-timeout` existed fall "
+             "back to the legacy 1800s with a warning -- set explicitly via "
+             "`evo config set per-exp-timeout <seconds>`.",
+    )
     run_p.add_argument(
         "--check",
         action="store_true",
@@ -5243,6 +6507,17 @@ def build_parser() -> argparse.ArgumentParser:
     discard_p.add_argument("exp_id")
     discard_p.add_argument("--reason", required=True)
     discard_p.add_argument(
+        "--failure-class",
+        dest="failure_class",
+        choices=["build", "eval", "hypothesis"],
+        default=None,
+        help="classify the failure so reuse/branch routing is explicit: "
+             "build = the artifact-production step broke (fix + retry/resume); "
+             "eval = the artifact is good but scoring/serving config is wrong "
+             "(preserve + retest, no rebuild); hypothesis = it ran clean but "
+             "didn't help (branch a new direction). Recorded on the node.",
+    )
+    discard_p.add_argument(
         "--force",
         action="store_true",
         help="force discard of an active node (the running benchmark may "
@@ -5278,6 +6553,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--reason", default=None,
         help="why this lineage is being pruned (optional; omit for routine "
              "round-N cleanups where the parent prune already explained the why)",
+    )
+    prune_kind_p = prune_p.add_mutually_exclusive_group()
+    prune_kind_p.add_argument(
+        "--exhausted",
+        action="store_true",
+        help="close this branch while keeping its score eligible for best "
+             "(default; backwards compatible)",
+    )
+    prune_kind_p.add_argument(
+        "--invalid",
+        action="store_true",
+        help="mark this result as invalid and exclude it and descendants "
+             "from best/frontier",
+    )
+    prune_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm invalidating a node on the current best valid spine",
     )
     prune_p.set_defaults(func=cmd_prune)
 
@@ -5593,13 +6886,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     install_p.add_argument(
         "--trust-hooks",
-        action="store_true",
-        help="Trust the plugin's hooks non-interactively (codex only). "
-             "By default codex installs hooks in untrusted state — they "
-             "register but never fire until reviewed via `codex /hooks`. "
-             "This flag writes the trusted_hash entries that the TUI would "
-             "write on user approval, enabling mid-run directives. Use only "
-             "if you've reviewed plugins/evo/hooks/hooks.json and accept it.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trust the plugin's hooks non-interactively (codex only; "
+             "default: on). Writes the trusted_hash entries codex's "
+             "`/hooks` review would write on approval; without them the "
+             "hooks register but never fire and `evo direct` is not "
+             "delivered. Pass --no-trust-hooks to review and trust the "
+             "hooks inside codex via `/hooks` instead.",
     )
     install_p.add_argument(
         "--version",
@@ -5611,10 +6905,9 @@ def build_parser() -> argparse.ArgumentParser:
     install_p.add_argument(
         "--force",
         action="store_true",
-        help="Re-run the host's marketplace install even if the install state "
-             "already exists. Without --force, the prereq is skipped when the "
-             "host plugin is already present (avoids overwriting a tag-pinned "
-             "install with default-branch content).",
+        help="Refresh the host marketplace/source even if one already exists. "
+             "Normal install still repairs evo config and cached plugin files; "
+             "--force is for replacing stale, pinned, or broken source state.",
     )
     install_p.set_defaults(func=cmd_install)
 
@@ -5635,10 +6928,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Refresh evo's installation. With <host>: update just that host. "
             "Without <host>: refresh the global CLI from PyPI, then update every "
-            "host whose `evo doctor` currently passes. Use --force to wipe the "
-            "host's plugin cache and reinstall from scratch (workaround for the "
-            "upstream Claude Code cache-invalidation bug, "
-            "anthropics/claude-code#14061)."
+            "host whose `evo doctor` currently passes. A normal update repairs "
+            "evo config, hooks, helper binaries, and cached plugin files. Use "
+            "--force when the host marketplace/source itself should be refreshed "
+            "or replaced."
         ),
     )
     update_p.add_argument(
@@ -5651,8 +6944,8 @@ def build_parser() -> argparse.ArgumentParser:
     update_p.add_argument(
         "--force",
         action="store_true",
-        help="Uninstall + wipe plugin cache + reinstall (routes around upstream "
-             "cache-invalidation bug). Use this for migrating from pre-0.4.1.",
+        help="Refresh/reinstall the host marketplace or source before repairing "
+             "the host integration.",
     )
     update_p.add_argument(
         "--scope",
@@ -5679,8 +6972,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_p.add_argument(
         "--trust-hooks",
-        action="store_true",
-        help="Trust the plugin's hooks non-interactively (codex only).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trust the plugin's hooks non-interactively (codex only; "
+             "default: on). Pass --no-trust-hooks to review via `/hooks` "
+             "inside codex instead.",
     )
     update_p.set_defaults(func=cmd_update)
 
@@ -5750,13 +7046,11 @@ def build_parser() -> argparse.ArgumentParser:
         "autonomous",
         help="Arm/disarm autonomous mode (the always-fire stop-nudge loop) for this session",
         description=(
-            "Opt-in to the autonomous optimize loop: when armed, the "
-            "orchestrator is re-prompted at every turn boundary to keep "
-            "driving the loop until its stall limit or interruption. The "
-            "orchestrator runs `evo autonomous on` when /optimize is invoked "
-            "with the `autonomous` param. Default (disarmed) /optimize keeps "
-            "the policy gate but stops naturally. `off` (or "
-            "`evo exit-optimize-mode`) disarms it."
+            "Autonomous mode re-prompts the orchestrator at every turn "
+            "boundary to keep driving the loop until its stall limit or "
+            "interruption. The optimize skill arms it by default unless the "
+            "user or stored config explicitly resolves autonomous off. `off` "
+            "(or `evo exit-optimize-mode`) disarms it."
         ),
     )
     autonomous_p.add_argument(
@@ -5777,13 +7071,11 @@ def build_parser() -> argparse.ArgumentParser:
         "subagents-only",
         help="Arm/disarm subagents-only mode (orchestrator may not edit; only subagents do)",
         description=(
-            "Opt-in to the delegate-to-subagents policy gate: when armed, the "
-            "orchestrator is blocked from editing files / running experiments "
-            "by hand, forcing it to dispatch to subagents. The orchestrator "
-            "runs `evo subagents-only on` when /optimize is invoked with the "
-            "`subagents-only` param. Default (disarmed) /optimize ALLOWS the "
-            "orchestrator to edit directly. `off` (or `evo exit-optimize-mode`) "
-            "disarms it."
+            "Subagents-only mode blocks the orchestrator from editing files / "
+            "running experiments by hand, forcing it to dispatch to subagents. "
+            "The optimize skill arms it by default unless the user or stored "
+            "config explicitly resolves subagents-only off. `off` (or "
+            "`evo exit-optimize-mode`) disarms it."
         ),
     )
     subagents_only_p.add_argument(
@@ -5798,25 +7090,365 @@ def build_parser() -> argparse.ArgumentParser:
 
     wait_p = sub.add_parser(
         "wait",
-        help="Block until any experiment reaches a terminal state, or until --timeout (max 1h)",
+        help="Block until a --for condition matches; --timeout caps (default 1h, max 24h)",
         description=(
-            "Polls <run_dir>/experiments/ for terminal-state transitions on "
-            "any experiment in the active run — outcome.json appearing "
-            "(committed / evaluated / failed) or an experiment dir vanishing "
-            "(discarded). Per-task trace writes and other in-flight activity "
-            "are ignored. Returns exit code 0 with a one-line summary on the "
-            "first detected transition, 124 on timeout. Intended for /optimize "
-            "orchestrators to block on subagent results instead of writing "
-            "ad-hoc bash polling loops."
+            "Default (no --for): watches BOTH experiments and ideators in the "
+            "active run; wakes on whichever changes first.\n"
+            "  Experiments wake on outcome.json appearing (committed/evaluated/"
+            "failed) or an experiment dir vanishing (discarded). Per-task trace "
+            "writes are ignored.\n"
+            "  Ideators wake on new lines appended to <run>/ideator/proposals.jsonl.\n"
+            "\n"
+            "--for accepts (may be repeated; any match wakes the wait):\n"
+            "  experiments            -- watch outcome.json activity\n"
+            "  ideators               -- watch ideator proposals\n"
+            "  process=<pid>          -- wake when pid is no longer alive.\n"
+            "                            (exit_code is only available if `evo "
+            "wait` is the parent process, which is usually not the case; the "
+            "JSON output reports exit_code: null in that situation.)\n"
+            "  log-growth=<path>      -- wake when the file's size stops growing "
+            "for --stall-threshold seconds\n"
+            "  gpu-active             -- wake when nvidia-smi reports util > 0\n"
+            "  gpu-idle               -- wake when nvidia-smi reports util == 0 "
+            "for --stall-threshold consecutive seconds\n"
+            "\n"
+            "--count N requires exactly one --for experiments|ideators; blocks "
+            "until N items land.\n"
+            "\n"
+            "--json emits a structured exit record with exit_reason, per-"
+            "condition state, and waited_seconds.\n"
+            "\n"
+            "Exit 0 on match. 124 on --timeout. 2 on argument errors."
         ),
     )
     wait_p.add_argument(
-        "--timeout", type=float, default=3600,
-        help="Seconds to block before giving up. Default 3600, capped at 3600.",
+        "--for",
+        dest="wait_for",
+        action="append",
+        default=None,
+        metavar="CONDITION",
+        help=(
+            "Add a wait condition. Repeatable. Values: experiments, ideators, "
+            "process=<pid>, log-growth=<path>, gpu-active, gpu-idle. "
+            "Default (no --for): experiments + ideators."
+        ),
+    )
+    wait_p.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help=(
+            "Block until N items of --for's kind land. Requires exactly one "
+            "--for experiments|ideators."
+        ),
+    )
+    wait_p.add_argument(
+        "--timeout", default="1h",
+        help=(
+            "Duration before giving up. Accepts seconds, e.g. 60, or 60m/2h. "
+            "Default 1h, capped at 24h."
+        ),
+    )
+    wait_p.add_argument(
+        "--stall-threshold", dest="stall_threshold", default="2m",
+        help=(
+            "Stall window for log-growth and gpu-idle conditions. "
+            "Accepts seconds or 60m/2h. Default 2m."
+        ),
+    )
+    wait_p.add_argument(
+        "--poll-interval", dest="poll_interval", default="5s",
+        help="Polling interval. Accepts seconds or 1m. Default 5s.",
+    )
+    wait_p.add_argument(
+        "--json", dest="json_out", action="store_true",
+        help="Emit a structured JSON exit record instead of the one-line summary.",
     )
     wait_p.set_defaults(func=cmd_wait)
 
     return parser
+
+
+def _telemetry_backend_props(name: str, config: dict[str, Any]) -> dict[str, Any]:
+    props: dict[str, Any] = {"backend": name}
+    provider = (config or {}).get("provider")
+    if provider:
+        props["provider"] = provider
+    return props
+
+
+def _telemetry_workspace_props(root: Path, exp_id: str | None = None) -> dict[str, Any]:
+    from . import telemetry
+
+    props: dict[str, Any] = {}
+    wid = telemetry.workspace_id(root)
+    if wid:
+        props["workspace_id"] = wid
+    if exp_id:
+        props["experiment_id"] = exp_id
+    try:
+        run_id = _load_meta(root).get("active")
+        if isinstance(run_id, str) and run_id:
+            props["run_id"] = run_id
+    except Exception:
+        pass
+    try:
+        host = get_host(root)
+        if host:
+            props["host"] = host
+    except Exception:
+        pass
+    try:
+        config = load_config(root)
+        graph = load_graph(root)
+        nodes = graph.get("nodes") or {}
+        node = nodes.get(exp_id) if exp_id else None
+        if isinstance(node, dict):
+            parent_id = node.get("parent")
+            if isinstance(parent_id, str) and parent_id:
+                props["parent_experiment_id"] = parent_id
+            status = node.get("status")
+            if isinstance(status, str) and status:
+                props["experiment_status"] = status
+            attempt = node.get("current_attempt")
+            if isinstance(attempt, int):
+                props["attempt"] = attempt
+            props["context"] = {
+                "has_score": node.get("score") is not None,
+                "has_children": bool(node.get("children")),
+            }
+        if exp_id and exp_id in nodes:
+            from .backends import backend_spec_for_node
+
+            backend_name, backend_config = backend_spec_for_node(
+                root,
+                nodes[exp_id],
+                workspace_config=config,
+            )
+        else:
+            from .backends import backend_spec_from_config
+
+            backend_name, backend_config = backend_spec_from_config(config)
+        props.update(_telemetry_backend_props(backend_name, backend_config))
+    except Exception:
+        pass
+    return props
+
+
+def _telemetry_pct_delta(delta: float | None, baseline: float | None) -> float | None:
+    if delta is None or baseline is None or baseline == 0:
+        return None
+    return round((delta / abs(float(baseline))) * 100.0, 6)
+
+
+def _telemetry_directional_delta(
+    metric: str | None,
+    score: float | None,
+    baseline: float | None,
+) -> float | None:
+    if score is None or baseline is None:
+        return None
+    if metric == "min":
+        return round(float(baseline) - float(score), 6)
+    return round(float(score) - float(baseline), 6)
+
+
+def _telemetry_failure_type(error: str | None) -> str | None:
+    if not error:
+        return None
+    lowered = error.lower()
+    if "remote_infra" in lowered or "failed_infra" in lowered:
+        return "infra"
+    if "timeout" in lowered:
+        return "timeout"
+    if "gate_failed" in lowered or "pre_gate_failed" in lowered:
+        return "gate"
+    if "runtime" in lowered or "hook" in lowered:
+        return "runtime"
+    if "benchmark" in lowered or "missing_result" in lowered:
+        return "benchmark"
+    return "unknown"
+
+
+def _telemetry_usecase_tags(root: Path) -> list[str]:
+    tags = _load_meta(root).get("telemetry_usecase_tags")
+    if isinstance(tags, list):
+        return [str(tag) for tag in tags if isinstance(tag, str)]
+    return []
+
+
+def _record_telemetry_usecase_tags(root: Path, tags: list[str]) -> None:
+    from . import telemetry
+
+    try:
+        meta_file = evo_dir(root) / "meta.json"
+        data = _load_meta(root)
+        sanitized = telemetry.scrub_tags(tags)
+        if sanitized:
+            data["telemetry_usecase_tags"] = sanitized
+            atomic_write_json(meta_file, data)
+    except Exception:
+        pass
+
+
+def _emit_experiment_result_telemetry(
+    root: Path,
+    exp_id: str,
+    *,
+    outcome: str,
+    metric: str | None,
+    score: float | None = None,
+    parent_score: float | None = None,
+    best_before_score: float | None = None,
+    check: bool = False,
+    failure_type: str | None = None,
+) -> None:
+    try:
+        from . import telemetry
+
+        delta_vs_parent = _telemetry_directional_delta(metric, score, parent_score)
+        delta_vs_best = _telemetry_directional_delta(metric, score, best_before_score)
+        props: dict[str, Any] = {
+            **_telemetry_workspace_props(root, exp_id=exp_id),
+            "experiment_id": exp_id,
+            "outcome": outcome,
+            "check": check,
+            "workflow_phase": "check" if check else "experiment_result",
+        }
+        if metric:
+            props["metric"] = metric
+        if delta_vs_parent is not None:
+            props["delta_vs_parent"] = delta_vs_parent
+            props["pct_delta_vs_parent"] = _telemetry_pct_delta(
+                delta_vs_parent, parent_score
+            )
+        if delta_vs_best is not None:
+            props["delta_vs_best"] = delta_vs_best
+            props["pct_delta_vs_best"] = _telemetry_pct_delta(
+                delta_vs_best, best_before_score
+            )
+        if failure_type:
+            props["failure_type"] = failure_type
+        usecase_tags = _telemetry_usecase_tags(root)
+        if usecase_tags:
+            props["usecase_tags"] = usecase_tags
+        telemetry.capture("experiment_result", props, flush=True, timeout=0.2)
+    except Exception:
+        pass
+
+
+def _branch_close_reason_type(
+    reason: str | None,
+    *,
+    failure_class: str | None = None,
+    prune_kind: str | None = None,
+) -> str:
+    if failure_class in {"build", "eval"}:
+        return "eval_issue"
+    if failure_class == "hypothesis":
+        return "bad_result"
+    if prune_kind == PRUNE_KIND_INVALID:
+        return "bad_result"
+    lowered = (reason or "").lower()
+    if "gate" in lowered:
+        return "gate_issue"
+    if any(token in lowered for token in ("infra", "remote", "provider", "sandbox")):
+        return "infra_issue"
+    if any(token in lowered for token in ("eval", "benchmark", "harness", "score")):
+        return "eval_issue"
+    if any(token in lowered for token in ("duplicate", "same")):
+        return "duplicate"
+    if any(token in lowered for token in ("abandon", "halt", "stop", "stuck")):
+        return "abandoned"
+    if any(token in lowered for token in ("regress", "worse", "bad")):
+        return "bad_result"
+    if reason:
+        return "manual"
+    return "unknown"
+
+
+def _emit_branch_closed_telemetry(
+    root: Path,
+    exp_id: str,
+    node: dict[str, Any],
+    *,
+    close_type: str,
+    reason: str | None = None,
+    prune_kind: str | None = None,
+    failure_class: str | None = None,
+) -> None:
+    try:
+        from . import telemetry
+
+        props: dict[str, Any] = {
+            **_telemetry_workspace_props(root, exp_id=exp_id),
+            "experiment_id": exp_id,
+            "close_type": close_type,
+            "workflow_phase": "branch_closed",
+            "status_before": str(node.get("status") or "unknown"),
+            "had_score": node.get("score") is not None,
+            "reason_type": _branch_close_reason_type(
+                reason,
+                failure_class=failure_class,
+                prune_kind=prune_kind,
+            ),
+        }
+        if prune_kind:
+            props["prune_kind"] = prune_kind
+        if failure_class:
+            props["failure_class"] = failure_class
+        telemetry.capture("branch_closed", props, flush=True, timeout=0.2)
+    except Exception:
+        pass
+
+
+def _telemetry_track_command(args: argparse.Namespace, rc: int, started_at: float) -> None:
+    if getattr(args, "command", None) == "telemetry":
+        return
+    try:
+        from . import telemetry
+
+        props: dict[str, Any] = {}
+        props["trigger"] = "cli"
+        command = getattr(args, "command", None)
+        if getattr(args, "host", None) in SUPPORTED_HOSTS:
+            props["host"] = args.host
+        if command == "init":
+            props["host"] = args.host
+            props["metric"] = args.metric
+            props["backend"] = "worktree"
+        root: Path | None = None
+        if command not in {"install", "uninstall", "doctor", "update"}:
+            try:
+                root = repo_root()
+                exp_id = getattr(args, "exp_id", None)
+                props.update(_telemetry_workspace_props(root, exp_id=exp_id))
+            except Exception:
+                root = None
+        if command == "install" and rc == 0:
+            event = "installed"
+            props["workflow_phase"] = "install"
+        elif command == "init" and rc == 0:
+            event = "workspace_initialized"
+            props["workflow_phase"] = "init"
+        elif command == "new" and rc == 0:
+            event = "experiment_created"
+            props["workflow_phase"] = "experiment_created"
+            if getattr(args, "exp_id", None):
+                props["experiment_id"] = args.exp_id
+            parent = getattr(args, "parent", None)
+            if parent:
+                props["parent_experiment_id"] = parent
+            props["parent_type"] = "root" if parent == "root" else "experiment"
+        elif command == "autonomous" and rc == 0:
+            event = "optimize_started"
+            props["workflow_phase"] = "optimize_started"
+            props["autonomous"] = (str(getattr(args, "state", "") or "on") == "on")
+        else:
+            return
+        telemetry.capture(event, props, flush=True, timeout=0.2)
+    except Exception:
+        pass
 
 
 def _maybe_auto_register() -> None:
@@ -5839,6 +7471,7 @@ def _maybe_auto_register() -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    started_at = time.monotonic()
     _maybe_auto_register()
     # Daily PyPI freshness check + legacy-install nudge. Both are silent on
     # any failure and skipped for `update` (so the user isn't told to update
@@ -5855,8 +7488,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         rc = args.func(args)
     except Exception as exc:  # noqa: BLE001
+        _telemetry_track_command(args, 1, started_at)
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
+    _telemetry_track_command(args, rc, started_at)
     sys.exit(rc)
 
 

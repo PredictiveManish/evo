@@ -244,6 +244,7 @@ def _make_node(exp_id: str, parent: str, status: str, **kwargs) -> dict:
         "worktree": str(Path("/tmp") / f"evo-mock-{exp_id}"),
         "commit": kwargs.get("commit"),
         "pruned_reason": None,
+        "prune_kind": None,
         "gates": [],
         "current_attempt": 0,
         "notes": [],
@@ -347,17 +348,86 @@ class TestDiscardGuards(unittest.TestCase):
                 self.assertNotIn("committed", str(exc).lower())
                 self.assertNotIn("active", str(exc).lower())
 
+    def test_discard_preserves_declared_worktree_artifacts(self):
+        """Registered result/trace artifacts should survive worktree cleanup."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _init_git_repo(root)
+
+            worktree = root / ".evo" / "run_0000" / "worktrees" / "exp_0001"
+            (worktree / "final_model").mkdir(parents=True)
+            (worktree / "final_model" / "adapter.bin").write_text("weights")
+            (worktree / "logs").mkdir()
+            (worktree / "logs" / "train.log").write_text("loss=0.1")
+
+            _build_graph_workspace(root, {
+                "exp_0001": _make_node(
+                    "exp_0001", "root", "evaluated",
+                    worktree=str(worktree), current_attempt=1, score=0.1,
+                ),
+            })
+            exp_dir = root / ".evo" / "run_0000" / "experiments" / "exp_0001"
+            attempt = exp_dir / "attempts" / "001"
+            traces = attempt / "traces"
+            traces.mkdir(parents=True)
+            (attempt / "result.json").write_text(json.dumps({
+                "score": 0.1,
+                "artifacts": {"training-log": "logs/train.log"},
+            }))
+            (traces / "task_main.json").write_text(json.dumps({
+                "task_id": "main",
+                "score": 0.1,
+                "artifacts": {"checkpoint": "final_model"},
+            }))
+
+            rc = self._run_discard(root, "exp_0001", reason="eval config mismatch")
+            self.assertEqual(rc, 0)
+            self.assertFalse(worktree.exists())
+
+            result = json.loads((exp_dir / "result.json").read_text())
+            self.assertEqual(result["status"], "discarded")
+            self.assertEqual(
+                result["artifact_manifest"],
+                "artifacts/discarded/manifest.json",
+            )
+            preserved = result["preserved_artifacts"]
+            self.assertEqual({item["label"] for item in preserved}, {"checkpoint", "training-log"})
+
+            stored = {item["label"]: exp_dir / item["stored_path"] for item in preserved}
+            self.assertEqual((stored["checkpoint"] / "adapter.bin").read_text(), "weights")
+            self.assertEqual(stored["training-log"].read_text(), "loss=0.1")
+
+            manifest = json.loads(
+                (exp_dir / "artifacts" / "discarded" / "manifest.json").read_text()
+            )
+            self.assertEqual(len(manifest["artifacts"]), 2)
+
 
 class TestPruneAcceptsEvaluated(unittest.TestCase):
     """Stage 3b: prune loosened to accept evaluated nodes too."""
 
-    def _run_prune(self, root: Path, exp_id: str, reason: str = "test"):
+    def _run_prune(
+        self,
+        root: Path,
+        exp_id: str,
+        reason: str = "test",
+        *,
+        invalid: bool = False,
+        exhausted: bool = False,
+        yes: bool = False,
+    ):
         from evo.cli import cmd_prune
         import os
         prev = os.getcwd()
         os.chdir(root)
         try:
-            ns = argparse.Namespace(exp_id=exp_id, reason=reason)
+            ns = argparse.Namespace(
+                exp_id=exp_id,
+                reason=reason,
+                invalid=invalid,
+                exhausted=exhausted,
+                yes=yes,
+            )
             return cmd_prune(ns)
         finally:
             os.chdir(prev)
@@ -379,9 +449,44 @@ class TestPruneAcceptsEvaluated(unittest.TestCase):
             graph = core.load_graph(root)
             self.assertEqual(graph["nodes"]["exp_0001"]["status"], "pruned")
             self.assertEqual(graph["nodes"]["exp_0001"]["pruned_reason"], "test")
+            self.assertEqual(graph["nodes"]["exp_0001"]["prune_kind"], "exhausted")
 
     def test_prune_still_accepts_committed_node(self):
-        """Sanity: existing happy path unchanged."""
+        """Sanity: existing non-spine happy path unchanged."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _init_git_repo(root)
+            _build_graph_workspace(root, {
+                "exp_0001": _make_node("exp_0001", "root", "committed",
+                                       score=0.7, commit="abc"),
+                "exp_0002": _make_node("exp_0002", "root", "committed",
+                                       score=0.9, commit="def"),
+            })
+            rc = self._run_prune(root, "exp_0001")
+            self.assertEqual(rc, 0)
+            from evo import core
+            graph = core.load_graph(root)
+            self.assertEqual(graph["nodes"]["exp_0001"]["prune_kind"], "exhausted")
+
+    def test_prune_invalid_sets_invalid_kind(self):
+        """Explicit invalid prune records invalid lineage semantics."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _init_git_repo(root)
+            _build_graph_workspace(root, {
+                "exp_0001": _make_node("exp_0001", "root", "committed",
+                                       score=0.7, commit="abc"),
+                "exp_0002": _make_node("exp_0002", "root", "committed",
+                                       score=0.9, commit="def"),
+            })
+            rc = self._run_prune(root, "exp_0001", invalid=True)
+            self.assertEqual(rc, 0)
+            from evo import core
+            graph = core.load_graph(root)
+            self.assertEqual(graph["nodes"]["exp_0001"]["prune_kind"], "invalid")
+
+    def test_prune_best_spine_exhausted_does_not_require_yes(self):
+        """Default/exhausted prune keeps result valid, so legacy usage works."""
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             _init_git_repo(root)
@@ -391,6 +496,33 @@ class TestPruneAcceptsEvaluated(unittest.TestCase):
             })
             rc = self._run_prune(root, "exp_0001")
             self.assertEqual(rc, 0)
+
+            from evo import core
+            graph = core.load_graph(root)
+            self.assertEqual(graph["nodes"]["exp_0001"]["status"], "pruned")
+            self.assertEqual(graph["nodes"]["exp_0001"]["prune_kind"], "exhausted")
+
+    def test_prune_best_spine_invalid_requires_yes(self):
+        """Invalidating the best path is high-impact and requires confirmation."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _init_git_repo(root)
+            _build_graph_workspace(root, {
+                "exp_0001": _make_node("exp_0001", "root", "committed",
+                                       score=0.7, commit="abc"),
+            })
+            with self.assertRaisesRegex(RuntimeError, "--yes"):
+                self._run_prune(root, "exp_0001", invalid=True)
+
+            from evo import core
+            graph = core.load_graph(root)
+            self.assertEqual(graph["nodes"]["exp_0001"]["status"], "committed")
+
+            rc = self._run_prune(root, "exp_0001", invalid=True, yes=True)
+            self.assertEqual(rc, 0)
+            graph = core.load_graph(root)
+            self.assertEqual(graph["nodes"]["exp_0001"]["status"], "pruned")
+            self.assertEqual(graph["nodes"]["exp_0001"]["prune_kind"], "invalid")
 
     def test_prune_rejects_active_node(self):
         """Active nodes still can't be pruned (running experiments)."""
@@ -427,6 +559,8 @@ class TestPruneAcceptsEvaluated(unittest.TestCase):
             _build_graph_workspace(root, {
                 "exp_0001": _make_node("exp_0001", "root", "committed",
                                        score=0.7, commit="abc"),
+                "exp_0002": _make_node("exp_0002", "root", "committed",
+                                       score=0.9, commit="def"),
             })
             err = io.StringIO()
             with patch("sys.stderr", err):
@@ -467,6 +601,7 @@ class TestRestore(unittest.TestCase):
                     "exp_0001", "root", "pruned",
                     score=0.7, commit="abc",
                     pruned_reason="exhausted",
+                    prune_kind="exhausted",
                 ),
             })
             rc = self._run_restore(root, "exp_0001")
@@ -476,6 +611,7 @@ class TestRestore(unittest.TestCase):
             graph = core.load_graph(root)
             self.assertEqual(graph["nodes"]["exp_0001"]["status"], "committed")
             self.assertIsNone(graph["nodes"]["exp_0001"].get("pruned_reason"))
+            self.assertIsNone(graph["nodes"]["exp_0001"].get("prune_kind"))
 
     def test_restore_discarded_node_recreates_branch(self):
         """Restoring a discarded node looks up `refs/evo-anchor/<run>/<exp>`,
@@ -631,7 +767,7 @@ class TestEvoRunWritesAnchorRef(unittest.TestCase):
             r = self._run_evo(root, [
                 "init", "--target", "agent.py",
                 "--benchmark", f"{PY} benchmark.py",
-                "--metric", "max", "--host", "generic",
+                "--metric", "max", "--host", "generic", "--per-exp-timeout", "1800",
             ])
             self.assertEqual(r.returncode, 0, f"init failed: {r.stderr}")
 
@@ -743,7 +879,7 @@ class TestNewAfterRestoreWorks(unittest.TestCase):
             r = self._run_evo(root, [
                 "init", "--target", "agent.py",
                 "--benchmark", f"{PY} benchmark.py",
-                "--metric", "max", "--host", "generic",
+                "--metric", "max", "--host", "generic", "--per-exp-timeout", "1800",
             ])
             self.assertEqual(r.returncode, 0, f"init: {r.stderr}")
 
@@ -946,7 +1082,7 @@ class TestPoolBackendAnchor(unittest.TestCase):
             r = self._run_evo(main_repo, [
                 "init", "--target", "agent.py",
                 "--benchmark", f"{PY} benchmark.py",
-                "--metric", "max", "--host", "generic",
+                "--metric", "max", "--host", "generic", "--per-exp-timeout", "1800",
             ])
             self.assertEqual(r.returncode, 0, r.stderr)
             r = self._run_evo(main_repo, [
@@ -1000,7 +1136,7 @@ class TestPoolBackendAnchor(unittest.TestCase):
             self._run_evo(main_repo, [
                 "init", "--target", "agent.py",
                 "--benchmark", f"{PY} benchmark.py",
-                "--metric", "max", "--host", "generic",
+                "--metric", "max", "--host", "generic", "--per-exp-timeout", "1800",
             ])
             self._run_evo(main_repo, [
                 "config", "backend", "pool", "--workspaces", slot_arg,

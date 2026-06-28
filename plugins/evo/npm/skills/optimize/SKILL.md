@@ -1,11 +1,84 @@
 ---
 name: optimize
-description: Run the evo optimization loop with parallel subagents until interrupted.
+description: Drive structured autoresearch iteration after evo:discover and the baseline commit. Use when the user invokes /evo:optimize or asks to try ideas, try variants, run experiments, use available GPUs, improve the current best/frontier, continue an evo search, or compare candidate changes in an evo workspace. The orchestrator plans and spawns optimization subagents; candidate edits/runs belong to those subagents. Width is set via subagents=N (1 for serial workloads, larger for parallel); the loop's structural value applies at any width.
 argument-hint: "[subagents=N] [budget=N] [stall=N]"
-evo_version: 0.4.5
+evo_version: 0.6.3
 ---
 
-Run the `evo` optimization loop. Each round, the orchestrator writes structured briefs and spawns parallel subagents that execute within them. Each subagent is semi-autonomous: it reads the pointer traces, forms the concrete edit, runs experiments, and can iterate within its branch. Runs until interrupted or the stall limit is reached.
+Run the `evo` optimization loop. Each round, the orchestrator writes structured briefs and spawns subagents that execute within them. Each subagent is semi-autonomous: it reads the pointer traces, forms the concrete edit, runs experiments, and can iterate within its branch. Runs until interrupted or the stall limit is reached.
+
+**This skill is the canonical loop for ALL post-discover work — including serial workloads.** If the workspace's resource profile forces width 1 (single GPU, single-process benchmark, etc.), you still invoke `/evo:optimize` -- just pass `subagents=1`. The loop's value is the STRUCTURE around each experiment (scan-subagent cross-cutting analysis between rounds, verifier pre/post hooks via the subagent skill, ideator spawning on stall, frontier reconciliation, stop-hook discipline), NOT just parallelism. Bypassing optimize because "I'm running serial work anyway" loses every piece of that structure -- you've reverted to ad-hoc experiment iteration with none of evo's loop benefits, just the bookkeeping.
+
+**Plain-language trigger.** In an initialized evo workspace, casual user wording
+like "try a couple ideas", "try different variants", "use the available GPUs",
+"continue from the current best", or "see what improves" is an optimize request
+unless the user explicitly asks for a read-only report. Do not treat the lack of
+a slash command as permission to bypass this protocol. Loading this skill from
+plain-language wording is also explicit authorization to use the host's
+subagent mechanism for the resolved round width; the user does not have to say
+"spawn subagents" or "parallel agents" separately.
+
+**Candidate-work delegation invariant.** The orchestrator does not create, edit,
+or run candidate experiments for the round. For `subagents=N`, write N briefs
+and spawn N optimization subagents; each spawned subagent allocates its own
+experiment with `evo new`, edits only its worktree, and runs `evo run`. Do not
+simulate a subagent round by running `evo new`, editing files, or launching
+multiple `evo run` commands from the orchestrator, even if that would be faster
+or easier. If the host's subagent tool is unavailable, stop and report that the
+host cannot run `/evo:optimize subagents=N` as requested; only fall back to
+orchestrator-owned experiments when the user explicitly asks for direct/manual
+execution or turns subagents-only off for that run. Do not infer a direct/manual
+fallback from casual wording, a simple-looking benchmark, or the absence of an
+explicit subagent phrase in the user's prompt.
+
+**Resource-cap invariant.** `subagents=N` is live concurrency, not total ideas.
+Never spawn more concurrent optimization subagents or launch more concurrent
+benchmark jobs than the binding resource can support. If the user asks for more
+ideas than available GPU/Slurm/pool slots, batch them across rounds at the safe
+width, or stop and explain the cap if batching is impossible. Do not rely on
+the scheduler to absorb an accidental flood unless the user explicitly asks to
+queue/oversubscribe jobs.
+
+**Bounded-run stop rule.** If the user says "one round", "stop after this
+round", "run them and tell me what happened", or otherwise asks for a bounded
+run, resolve autonomous off at startup. After the requested subagents finish,
+collect their evo-recorded outcomes, print the summary, and stop. Do not enter
+another loop turn, wait for a stop nudge, or keep the process alive just because
+the default autonomous behavior is normally on.
+
+## Evo surface -- loop-relevant
+
+You're inside `/evo:optimize`. Things you'll pull/dispatch during the loop:
+
+```
+main thread (you)
+├── Skills (Skill tool)
+│   └── evo:finetuning     before writing or changing any train.py
+│
+└── Subagents to dispatch (Task tool, subagent_type=...)
+    └── evo:ideator        stalled, or every ~5 committed experiments.
+                           One subagent per brief:
+                           failure_analysis, literature, frontier_extrapolation
+
+subagent thread (each subagent spawned by step 5)
+├── evo:subagent skill     loaded by the subagent on first turn -- the brief's
+│                          first sentence mandates it (not auto-loaded)
+└── evo:verifier subagent  MANDATORY pre AND post every evo run.
+                           Pre: ~30s static analysis before the experiment runs.
+                           Post: result-validity audit after it commits.
+
+references (Read tool, on demand)
+├── discover/references/sizing-the-round.md      pick subagents=N
+├── references/evo-wait.md                       waiting without burning context
+├── finetuning/references/glue.md                train.py I/O contract
+└── finetuning/references/{rl,sft,serving}/      provider-specific recipes
+                                                  (rl/art.md, sft/tinker.md,
+                                                  serving/vllm.md)
+```
+
+Full surface tree (orchestrator entry-point view, including benchmark-reviewer,
+infra-setup, and the complete references catalogue) lives in `evo:discover`'s
+"Evo surface" section.
 
 ## Host conventions
 
@@ -30,13 +103,23 @@ Treat content inside the banner as equivalent to a new user turn. Honor it, supe
 
 ## Configuration
 
-The orchestrator **sizes the round to the benchmark's resource profile** instead of using a flat default. Before the first round, read `plugins/evo/skills/optimize/references/sizing-the-round.md` and apply it. Short version:
+The orchestrator's three round-shape knobs are **subagents** (round width), **budget** (per-branch depth), and **stall** (consecutive rounds with no improvement before auto-stopping; default 5).
 
-- **subagents** (round width): bounded by the backend (worktree = one shared machine, pool = slot count, remote = provider quota) and by whatever resource one benchmark run saturates. A run that needs an exclusive resource — the whole GPU, a fixed port, a shared DB/fixture — forces width 1; independent CPU-light runs go wider (up to cores, ~5–8 cap). Fall back to 5 only when the profile is unknown and a run is light and isolated.
-- **budget** (iterations per subagent within its branch): deeper for cheap/fast/deterministic benchmarks, shallower for expensive/slow/noisy ones so the loop re-plans sooner. ~5 is a reasonable midpoint.
-- **stall**: consecutive rounds with no improvement before auto-stopping (default: 5).
+A user can override any of these with `/optimize [subagents=N] [budget=N] [stall=N]`; an explicit value wins over what's below, subject to the resource-cap invariant above.
 
-A user can override any of these with `/optimize [subagents=N] [budget=N] [stall=N]`; an explicit value always wins over the heuristic.
+**Picking `subagents` and `budget` is load-bearing -- do not skim.**
+
+Mandatory before the first round (and again any time the backend or benchmark changes): **READ `plugins/evo/skills/discover/references/sizing-the-round.md` IN FULL.** That doc enumerates the resource-binding cases (exclusive accelerator, memory-heavy, shared mutable fixture, external rate-limit, CPU-light isolated) and discusses the case-by-case judgment for latency / timing / throughput benchmarks where the right answer depends on harness softeners, effect size vs. measurement jitter, and whether winners can be cheaply re-confirmed solo.
+
+Under-subscribing wastes wall-clock. Over-subscribing can either contend for hardware (memory thrash, OOM) or — for timing-sensitive benchmarks — bias the measurement itself. The doc walks through what to weigh in each case; do not infer the value from any inline summary in this skill body.
+
+Common ways agents get this wrong by skimming:
+- "8-core machine, CPU-light → width 5" sounds right but skips the question of whether the metric is corruptible by sibling-process pressure. The doc has the judgment framing.
+- "Worktree backend has no slot cap so I can go higher" — worktree just shifts the cap from infrastructure to the binding resource. Same hardware, no safety net.
+
+If `.evo/project.md` records a resource profile (it should, after `/evo:discover`), START from that. The reference doc is what you use to APPLY it. If the profile is missing or thin, that's a discover-step bug — fix it (write a resource profile that names the binding resource explicitly) before continuing.
+
+In your opening message, state the width/budget you chose AND a one-line reason that references the binding-resource framing FROM THE DOC (e.g. "width 1 — exclusive GPU; budget 8 — runs deterministic"; or "width 3 — CPU-light isolated, but harness reports stable jitter at this concurrency so promoting solo-confirm gate; budget 5"). If your reason doesn't connect to the doc's framing, go back and read it.
 
 - **autonomous**: the keep-going loop. **Default: on** — evo is autoresearch; it runs unattended. Turn off for a run with `evo autonomous off`.
 - **subagents-only**: gate orchestrator edits, pushing all edits through subagents. **Default: on**. Turn off for a run with `evo subagents-only off`.
@@ -55,6 +138,20 @@ evo defaults get subagents-only --json
 ```
 
 As your **very first actions, before the loop**, resolve each and arm it: run `evo autonomous on` / `evo subagents-only on` when it resolves on, or `evo autonomous off` / `evo subagents-only off` when an explicit instruction or stored default turned it off. If a behavior resolves off — whether from the user's instruction this run or a stored default — say so in your opening message (e.g. "autonomous off — running one round at a time, as you asked") so it's never invisible.
+
+**Orchestrator driver.** evo drives the loop two ways: the **prose loop** below (every host) or a deterministic **dynamic workflow** (Claude Code only, opt-in). **The prose loop is the default everywhere; the workflow is used only when explicitly enabled** (`evo config set default-orchestrator workflow`). Resolve which as part of your very first actions:
+
+1. `evo host show` — the workflow driver requires `claude-code`. If it prints `<not set>` (a pre-host workspace), determine your actual runtime from your own context (system prompt, env such as `CLAUDECODE=1`, self-identity): **only if you are genuinely Claude Code**, do the one-time host migration now (`evo host set claude-code`) and continue; if you are any other runtime, do NOT stamp the host here — leave it for Step 0.1 and use the prose loop.
+2. `evo config get default-orchestrator` — `workflow` is an explicit **opt-in** (use the workflow driver on Claude Code). `prose` **or unset** resolves to the prose loop. An explicit user instruction this run still wins.
+
+**Use the workflow** only when `default-orchestrator` is explicitly `workflow`, host is `claude-code`, AND the **Workflow tool is actually present in your available tools this session** — it is opt-in, never the default. The availability check is load-bearing: **older Claude Code builds do not ship the Workflow tool**, so verify it's really in your toolset; do not assume it exists from the host alone. Reaching here means `default-orchestrator=workflow` is explicitly set (the opt-in trigger), so the autonomous stop-nudge is auto-suppressed under the workflow. Launch it once, do NOT drive the loop turn-by-turn:
+
+- Call the **Workflow** tool with `scriptPath: ${CLAUDE_PLUGIN_ROOT}/skills/optimize/workflows/evo-optimize.js` and `args: {pluginRoot: "${CLAUDE_PLUGIN_ROOT}", subagents: <N>, budget: <N>, stall: <N>}`, using the round sizing you resolved above. **Pass all four keys explicitly — never omit one.** For `stall`, use the user's `/optimize stall=N` override if given, else the default 5. (The workflow's stop condition is the stall limit, so a dropped `stall` silently reverts it to 5.)
+- Report the returned `runId` and tell the user to watch progress with `/workflows`. The workflow runs the round loop itself (orient → mandatory scan + cross-history axis check → ideators on stall/periodic → briefs → fan-out + verify → collect → frontier-select → stall) plus the concurrent meta controller; you do **not** execute "The Loop" section below, and you do **not** need autonomous mode (the workflow self-drives; its stall limit is the stop).
+
+Use **The Loop** below by default — it is the prose driver on every host, and the path whenever the workflow is not explicitly enabled (`default-orchestrator` unset or `prose`), the host is not `claude-code`, or the Workflow tool is unavailable (e.g. an older Claude Code build). The workflow is only an execution strategy over the same `evo` CLI; gates, frontier, dashboard, and recovery are identical either way.
+
+**Reconcile config when you fall back to prose.** The stop-nudge that drives the prose loop is auto-suppressed whenever `default-orchestrator` is `workflow`. So if you fall back to the prose loop on Claude Code because the Workflow tool isn't available (older build) while `default-orchestrator` is still `workflow` from a prior run, you MUST set it back — `evo config set default-orchestrator prose` — and arm autonomous as usual. Otherwise the prose loop's stop-nudge stays suppressed and the run stalls after one round. Invariant to preserve: `default-orchestrator=workflow` in config iff the workflow is actually the driver this run.
 
 **Autonomous mode.** Off lets you stop naturally at a turn boundary — finish a round, report, and stop. On arms the stop-nudge: at every turn boundary you are re-prompted to keep driving the loop until the **stall** limit is hit or the user interrupts. Without it, the loop does NOT force-continue across turn boundaries. To stop an autonomous run, the user runs `evo autonomous off` or `evo exit-optimize-mode`.
 
@@ -84,6 +181,13 @@ files or the attempt should be treated as `remote_infra_failure`.
 **Infra setup is not user-invocable.** If a remote provider is missing SDKs, auth, or setup details, read `plugins/evo/skills/infra-setup/references/provider-matrix.md`. It summarizes what each provider actually needs and replaces the old per-provider prompt files.
 
 **Runtime recipe/env.** Benchmark runtime is evo configuration, not something subagents should rediscover or copy into worktrees. Use `evo config runtime show` for prepare/before-run/prefix and `evo env show` for redacted env sources. If a run fails because expected runtime setup or env is missing, report it as setup failure or configure it from the orchestrator; do not patch benchmark code to bake in secrets or local paths. Use `evo run <exp_id> --check` for non-committing wiring validation; do not invent ad-hoc validation wrappers.
+
+**Replicated/noisy benchmarks.** If the user or `.evo/project.md` says an idea
+must pass `n=3`, `n=10`, median, mean, held-out, or cross-dataset evaluation,
+configure the benchmark so each `evo run` records the grouped aggregate as that
+experiment's score. Do not represent replicates as independent evo experiments
+and do not judge, report, or promote an idea by its best replicate. The frontier
+and best path must see the same aggregate statistic the user uses for decisions.
 
 **CLI reference.** If you are unsure which command to use, read `plugins/evo/skills/references/cli-quick-reference.md`. It is the canonical command map; this skill only repeats the high-frequency commands.
 
@@ -236,7 +340,15 @@ Spawn all subagents in a **single batch** using your host's parallel-subagent to
 Per host, the spawn shape matters because evo's loop depends on *completion notifications* arriving turn-by-turn (so the orchestrator can review each subagent's outcome and decide round 2):
 
 - **claude-code** — fire one `Bash(run_in_background=true)` call per brief. The bash invokes the subagent (the host's `Task` tool, or any equivalent that runs the brief to completion). Each backgrounded bash returns immediately and the runtime delivers a `<task-notification>` at a later turn when each subagent finishes. Do NOT wait on subagents inline; fan them out, then exit your current turn — notifications arrive in subsequent turns.
-- **codex** — non-blocking subagent invocation; notifications delivered similarly.
+- **codex** — call `spawn_agent` once per optimization brief. If `spawn_agent`
+  is deferred or not visible yet, first use Codex's tool-discovery tool
+  (`tool_search`) with a query like `spawn agent subagent`, then call the
+  discovered spawn tool. The optimize skill's plain-language trigger is
+  sufficient authorization for this; do not stop or fall back to direct edits
+  merely because the user did not explicitly write "spawn subagents." The
+  candidate worker prompt is the one that starts with the mandatory "First,
+  load and follow..." sentence below. A later read-only scan subagent does not
+  count toward the round width.
 - **hermes** — `terminal(background=true)`; notifications delivered similarly.
 - **openclaw** — `sessions_spawn deliver:false`; notifications delivered similarly.
 - **opencode** — *batch-parallel only* (no background notifications). Fire N `task` calls in ONE assistant message; all `tool_result`s return together when the slowest finishes. Plan all parallel work (including non-task tools) in that single message — opencode cannot interleave reasoning across turns while subagents run.
@@ -258,6 +370,11 @@ Then append:
 
 The opening sentence is non-negotiable — without it small models often skip the evo CLI and edit files directly, which produces no committed experiments and breaks the round.
 
+Before leaving step 5, check yourself: the number of optimization subagents you
+spawned must equal the resolved `subagents=N` unless the user explicitly
+requested a smaller direct/manual run. Scan/analysis subagents are separate and
+do not count toward this number.
+
 ### 6. Collect results and update state
 
 After all subagents complete:
@@ -271,16 +388,18 @@ After all subagents complete:
 
 **Cross-cut the round's evaluated nodes.** Before moving on, read `experiments/<id>/attempts/NNN/outcome.json` for each evaluated node from this round. The structured `gates[]` entries and `benchmark.result` let you spot shared failure modes the subagent summaries may have glossed over (e.g., three different subagents produced evaluated nodes whose gate_failures all included `refund_flow` -- that's a structural constraint the next round must confront, not three independent bad hypotheses).
 
-Prune dead branches where 3+ children all regressed:
+Prune branches you have decided are exhausted:
   ```bash
-  evo prune <exp_id> --reason "exhausted: N children all regressed"
+  evo prune <exp_id> --exhausted --reason "exhausted: <why>"
   ```
 
-`evo prune` accepts `committed` or `evaluated` nodes. Use it when you want
-to mark a lineage exhausted while preserving the result for later review or
-reference. Prune keeps the git commit alive (anchored at `refs/evo-anchor/<run>/<exp>`)
-so the node can be restored if needed. **Never `evo discard` a committed
-node** — it would orphan the branch ref and risk losing the commit.
+`evo prune` accepts `committed` or `evaluated` nodes:
+- `--exhausted` (default/legacy): stop branching here; the result still counts.
+- `--invalid`: this result is wrong; exclude it and descendants from best/frontier.
+- `--yes`: required only with `--invalid` on the current best valid spine.
+
+Use `--invalid --yes` when you have proven a best-spine result or ancestor is
+wrong. **Never `evo discard` a committed node** -- prune preserves its commit.
 
 If a previously-pruned (or discarded-then-restored) node is worth revisiting:
   ```bash
@@ -297,6 +416,86 @@ Update notes with cross-cutting learnings:
   evo set <exp_id> --note "key insight from round N"
   ```
 
+### 6a. Pattern recognition across history (objective, not narrative)
+
+Step 6 cross-cuts a single round. This step looks across ALL committed experiments in the run, not just this round's. The orchestrator's failure mode is tunnel vision -- iterating on the visible axis (whatever knob the recent rounds touched) while missing the orthogonal axis (the harness itself, the score definition, the environment, the input data, plumbing). The check is cheap, runs between rounds, and is the most reliable signal that you're on the wrong axis.
+
+Four checks via `evo show` + `evo tree`:
+
+1. **Score plateaus across structurally distinct hypotheses.** Read the `hypothesis` strings of committed experiments. If 3+ experiments with materially different hypotheses (not minor parameter sweeps of the same idea) all commit at the same score, the bottleneck is not where the hypotheses were aiming. The next move belongs on an axis none of those hypotheses touched.
+
+2. **Repeated failure class.** Tally failure indicators across discarded + failed nodes in the run so far: `gate_failures` names, non-zero exit codes, shared error-message fragments in `benchmark_err.log`. If 2+ failures share a class, that class is structural -- fix the cause, rather than queuing more experiments that will hit the same wall.
+
+3. **Internal-vs-benchmark delta.** Compare each evaluated node's *internal* indicators (progress signals the experiment's own process produces during a run -- intermediate test pass-rates, training loss, build success, agent self-report metrics, whatever the trace stream carries) to its *committed* benchmark score. Healthy internal signal + flat benchmark score = the experiment is optimizing something the benchmark does not reward. The fix is usually in the harness, output format, or score definition -- not in another hypothesis on the same axis.
+
+4. **Annotate facts, not narratives.** Annotations via `evo annotate <exp_id>` and `evo set <exp_id> --note` should record what HAPPENED -- scores, exact error messages, surprising observations, sources used. Not what you hoped would happen, what you plan to try next, or how you feel about the result. Annotations get loaded into future decision context and into ideator briefs; narrative noise contaminates them. State facts; leave plans to TodoWrite or `evo set --note` on the round itself.
+
+If any check surfaces a structural issue, the next round's subagent briefs should target the orthogonal axis the pattern identifies. Another iteration on a plateaued or systematically-failing axis produces another data point with the same conclusion.
+
+### 6b. Periodically spawn ideators (in parallel)
+
+The optimize loop's scan sub-agents (step 3) read the CURRENT round's evaluated experiments for failure patterns. They don't do deep cross-graph analysis or external literature scans -- that work belongs to the ideator skill (`evo:ideator`).
+
+Spawn ideators in parallel when ANY of these triggers fire:
+
+- **Periodic**: every N=5 committed experiments since the last ideator round
+- **Stall**: best score unchanged for M=3 consecutive committed experiments (the stall counter from step 6)
+- **Failure cluster**: M=3 consecutive discards with related root causes (use the `evo discards` output)
+- **User-triggered**: a directive (`evo direct`) asks for fresh ideas
+
+When a trigger fires, spawn three parallel **evo ideator subagents** via your host's Task tool -- one per brief:
+
+```
+Task(subagent_type="evo:ideator", prompt="workspace=<path>\nbrief=failure_analysis")
+Task(subagent_type="evo:ideator", prompt="workspace=<path>\nbrief=literature")
+Task(subagent_type="evo:ideator", prompt="workspace=<path>\nbrief=frontier_extrapolation")
+```
+
+| Brief | What it does |
+|---|---|
+| `failure_analysis` | Cross-graph clustering of discards/failures |
+| `literature` | Web/arXiv scan for untried techniques in the workspace domain |
+| `frontier_extrapolation` | Deeper variants of the steepest score gradient on the best path |
+
+Each subagent runs the brief in its own context, appends proposals as JSONL lines to `.evo/run_<run_id>/ideator/proposals.jsonl` (single final write), and returns a JSON summary. See `plugins/evo/agents/ideator.md` for the full procedure each ideator follows.
+
+Ideators take 5-10 min while the optimize loop's next round is typically 1-2 min away. If you fire and continue, proposals miss the next round's brief-writing every time. Two patterns work:
+
+- **Block here briefly.** If the trigger was a STALL or FAILURE CLUSTER, the next round's quality depends on fresh ideas -- block until enough proposals land:
+  ```bash
+  evo wait --for ideators --count 3 --timeout 900   # 15 min cap, fail-open
+  ```
+  Exit 0 means the proposals are ready; exit 124 (timeout) means proceed with whatever's available -- proposals.jsonl may have partial results.
+
+- **Fire and continue for periodic spawns** (every-N-commits trigger). The next round can run without proposals; the round after that will read them once they land. Use this when there's plenty of in-graph signal still to extract.
+
+### 6c. Reconcile ideator proposals at brief-writing time
+
+Before writing the next round's briefs (step 4 of the next iteration), check for new ideator proposals:
+
+```bash
+# Read proposals newer than the last round
+test -f .evo/run_*/ideator/proposals.jsonl && \
+  tail -n +1 .evo/run_*/ideator/proposals.jsonl | \
+  jq -s --argjson cutoff "$LAST_ROUND_END_TS" \
+    'map(select(.generated_at > $cutoff))'
+```
+
+If you fired ideators in 6b WITHOUT blocking (periodic trigger) and they haven't landed yet, you can also wait here -- but only a short timeout, since brief-writing should not stall indefinitely:
+
+```bash
+evo wait --for ideators --count 1 --timeout 120   # 2 min cap, fail-open
+```
+
+For each new proposal:
+
+1. Check the workspace graph -- has the proposed config already been tried? Use `evo discards --like "<keyword>"` to scan. If yes, skip.
+2. Score each remaining proposal by `expected_score_uplift × confidence`. Confidence ranking: `frontier_extrapolation > failure_analysis > literature`, all else equal.
+3. The top 1-2 proposals become objectives in the next round's briefs (step 4). Cite the proposal's `hypothesis` and `mechanism` in the brief's *Objective* field.
+4. Leave the rest in the queue -- they may surface as winners after a few more rounds when the frontier shifts.
+
+Proposals are advisory, not mandatory. If none look better than what step 3's scan sub-agents surfaced from in-graph signal, ignore them and proceed with the in-graph briefs. Ideator output complements, doesn't replace.
+
 ### 7. Continue or stop
 
 **Continue** if:
@@ -304,18 +503,72 @@ Update notes with cross-cutting learnings:
 - User hasn't interrupted
 - Score hasn't reached the theoretical maximum
 
+To continue, go back to step 1.
+
 **Stop** if:
 - Stall counter >= stall limit (N consecutive rounds with no improvement)
 - Score reached theoretical maximum (1.0 for max metric, 0.0 for min metric)
 - User interrupted
 
-On stop, print a final summary:
+On stop, the loop is done -- do not go back to step 1. Print a final summary:
 - Best score achieved and experiment ID
 - Total experiments run across all rounds
 - The winning diff: `evo diff <best_exp_id>`
 - Suggested next steps if the score hasn't converged
+- **How to land it:** point the user at `/evo:ship` to turn the winning
+  experiment into a mergeable change (a PR when the repo has a remote, else a
+  merge into the working branch). The raw winning diff is not the artifact to
+  merge by hand -- `/evo:ship` distills it to the minimal clean change and
+  attaches a mergeability report. Mention this whenever the run produced a
+  committed experiment that beats the baseline.
 
-Go back to step 1.
+### 8. Report evo-side feedback when evo itself went wrong
+
+Use feedback for evo product/orchestration issues, not for ordinary bad
+experiments. Good triggers: confusing CLI behavior, subagent handoff failures,
+workflow/meta-controller mistakes, recovery that failed, remote backend handling
+that was hard to diagnose, or an evo policy/gate that blocked the wrong thing.
+The command is anonymous and no-ops when telemetry is off; do not branch on that.
+
+Keep the report public-safe but actionable enough for the evo backend team to
+reproduce the case. Include the phase, what you expected evo to do, what it did,
+and a generic repro shape. Do not include repo names, company names, file paths,
+commands, prompt text, raw logs, URLs, secrets, dataset names, or exact task
+examples. If the issue is tied to a specific evo experiment, include its
+anonymous experiment id with `--exp-id`.
+
+```bash
+evo telemetry feedback \
+  --exp-id exp_0007 \
+  --kind orchestration \
+  --phase optimize \
+  --summary "Subagent completed but the orchestrator did not collect its evaluated result before writing the next round briefs." \
+  --expected "Round collection should wait for all dispatched subagents or clearly report the missing one." \
+  --actual "The next round was planned from partial results, leaving one evaluated node out of the pattern scan." \
+  --repro "Run optimize with multiple subagents on a workspace where one branch finishes after the first completion notification." \
+  --tag optimize-loop --tag subagent-handoff --tag collection
+```
+
+## Polling discipline
+
+When waiting on a long-running background process (a subagent's training subprocess, a long evaluation, a batch job), do NOT use `while true; do sleep N; tail file; done`. That loop never exits when the underlying process crashes -- the tail keeps reading the same dead file, the agent interprets "no growth" as "still working," and the agent blocks indefinitely.
+
+Use `evo wait`. The CLI is the bounded, structured replacement:
+
+```bash
+# wait until the training subprocess exits, OR its log stalls, OR the GPU goes idle,
+# whichever first; 60-minute ceiling; structured JSON on stdout
+evo wait --for process=$TRAIN_PID \
+         --for log-growth=$TRAIN_LOG \
+         --for gpu-idle \
+         --timeout 60m --stall-threshold 5m --json
+```
+
+Multiple `--for` flags combine; the wait returns on the first matching condition. The JSON output's `exit_reason` and `triggered_by` identify which condition fired. Process / log-growth / gpu-* watches do not require an evo workspace context; the workspace-anchored watches (`--for experiments`, `--for ideators`) cover the ideator + commit waits described elsewhere in this skill.
+
+Full surface, exit codes, JSON shape, examples: `references/evo-wait.md` (under `plugins/evo/skills/references/`).
+
+If `evo wait` is not available for some reason (older CLI on PATH, sandbox constraint), fall back to a bounded poll loop that checks all three signals -- process liveness via `kill -0 $PID`, log growth via `wc -c` delta, GPU via `nvidia-smi --query-gpu=utilization.gpu` -- and exits on any one going negative. NEVER unbounded `while true`.
 
 ## Resetting the eval epoch
 

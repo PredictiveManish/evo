@@ -95,10 +95,10 @@ def _detect_host_from_env() -> str:
     on codex-cli 0.130. Keep this in sync with
     registry.HOST_SESSION_ENV_VARS.
     """
-    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        return "claude-code"
     if os.environ.get("CODEX_THREAD_ID"):
         return "codex"
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return "claude-code"
     if os.environ.get("HERMES_SESSION_ID"):
         return "hermes"
     if os.environ.get("OPENCODE_SESSION_ID"):
@@ -167,7 +167,7 @@ def _resolve_root_from_payload(payload: dict) -> Path | None:
     return None
 
 
-_DELIVER_EVENTS = ("stop", "subagentStop", "preToolUse")
+_DELIVER_EVENTS = ("stop", "subagentStop", "preToolUse", "Stop", "SubagentStop", "PreToolUse")
 
 
 def _cursor_tool_class(tool_name: str | None) -> str:
@@ -342,11 +342,10 @@ def _maybe_mark_engaged_from_shell(
         queue.init_offset_to_latest(root, session_id)
 
 
-# evo control commands observed from the agent's shell. Cursor has no
-# session env var, so `evo autonomous on` / `evo subagents-only on` run from
-# the agent's shell can't self-detect its session via the CLI; we observe
-# the command here and arm/disarm the session record directly (same idea as
-# _maybe_mark_engaged_from_shell).
+# evo control commands observed from the agent's shell. Some hosts do not expose
+# their session id to shell subprocesses consistently, so `evo autonomous on` /
+# `evo subagents-only on` may not self-detect the same session the hook is
+# handling. Observe the command here and arm/disarm the hook session directly.
 _AUTONOMOUS_ON_RE = _re.compile(r"^\s*evo\s+autonomous(\s+on)?\s*$")
 _AUTONOMOUS_OFF_RE = _re.compile(r"^\s*evo\s+autonomous\s+off\s*$")
 _SUBAGENTS_ONLY_ON_RE = _re.compile(r"^\s*evo\s+subagents-only(\s+on)?\s*$")
@@ -361,17 +360,13 @@ def _maybe_mark_autonomous_from_shell(
     hook_event: str | None,
     payload: dict | None,
 ) -> None:
-    """For self-contained hosts (currently Cursor): observe the agent's
-    `evo autonomous on|off` / `evo subagents-only on|off` (or `evo
-    exit-optimize-mode`) shell command and arm/disarm the matching session
-    flag in-process. Cursor's CLI invocation can't self-detect its session
-    (no env var), so the command would no-op via `detect_session`; observing
-    it here is what actually arms it. Idempotent."""
-    if host != "cursor":
+    """Observe `evo autonomous on|off` / `evo subagents-only on|off` shell
+    commands and arm/disarm the matching hook session in-process. This is
+    idempotent and covers hosts whose shell subprocess lacks the same session
+    env var the hook payload carries."""
+    if host not in ("cursor", "codex", "claude-code"):
         return
-    if hook_event != "preToolUse":
-        return
-    if _cursor_tool_class((payload or {}).get("tool_name")) != "shell":
+    if hook_event not in ("preToolUse", "PreToolUse"):
         return
     cmd = ((payload or {}).get("tool_input") or {}).get("command", "")
     if not isinstance(cmd, str):
@@ -1377,6 +1372,9 @@ def _maybe_stop_nudge_text(
       - session must be orchestrator-class (no exp_id).
       - optimize_mode must be true on the session record.
       - autonomous must be true on the session record (the opt-in).
+      - default-orchestrator must NOT be `workflow`: the dynamic workflow
+        self-drives the round loop in-process, so the always-fire nudge
+        would double-drive (re-prompt after the workflow already finished).
       - host must have a working stop-continuation envelope:
         claude-code/codex use `{decision: "block", reason: …}`; cursor
         uses `{followup_message: …}` (auto-submitted at turn end).
@@ -1394,6 +1392,18 @@ def _maybe_stop_nudge_text(
         return None  # opt-in only; default /optimize stops naturally
     if host not in ("claude-code", "codex", "cursor"):
         return None  # no known stop-continuation envelope on this host
+    # Workflow driver self-drives: the dynamic workflow runs the whole round loop in-process
+    # (one long Workflow tool call) until its own stall limit. The always-fire stop nudge is the
+    # PROSE-loop driver; under the workflow it is redundant and would just re-prompt the agent to
+    # relaunch after the workflow already finished. Suppress it when default-orchestrator=workflow
+    # so the two drivers never both drive. (Best-effort: if config can't be read, fall through to
+    # the nudge, preserving prior behavior.)
+    try:
+        from ..core import load_config
+        if (load_config(root) or {}).get("default_orchestrator") == "workflow":
+            return None
+    except Exception:  # noqa: BLE001 — config unreadable: don't change behavior
+        pass
     return _STOP_NUDGE_TEMPLATE
 
 
